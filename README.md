@@ -14,10 +14,16 @@ there's no quality loss and no slow video re-encode.
 
 ## Engines
 
-| Engine | Speed (M-series Mac) | Best at | Download |
+| Engine | Speed (M-series Mac, 60 s clip end-to-end) | Best at | Download |
 |---|---|---|---|
-| **Fast** — [RNNoise](https://github.com/xiph/rnnoise) (WASM SIMD by [Shiguredo](https://github.com/shiguredo/rnnoise-wasm)) | ~50–100× realtime | Steady noise: fans, AC, hiss, hum | in base ~36 MB |
-| **High quality** — [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) (official `wasm` feature, tract runtime, built via `scripts/build-dfn3-wasm.sh`) | ~2.5× realtime (stereo) | Non-stationary noise: traffic, horns, babble, keyboards | +17 MB |
+| **Fast** — [RNNoise](https://github.com/xiph/rnnoise) (WASM SIMD by [Shiguredo](https://github.com/shiguredo/rnnoise-wasm)) | ~5 s (≈12× realtime incl. demux/remux) | Steady noise: fans, AC, hiss, hum | in base ~36 MB |
+| **High quality** — [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) (official `wasm` feature, tract runtime, built via `scripts/build-dfn3-wasm.sh`) | ~7 s (≈9× realtime incl. demux/remux) | Non-stationary noise: traffic, horns, babble, keyboards | +17 MB |
+
+Denoising is **parallelized across CPU cores**: the audio is split into 6 s chunks
+(each prefixed with 1 s of state-priming audio that is discarded, seams stitched with
+a 20 ms crossfade) and fanned out to a pool of Web Workers — up to 8 for RNNoise and
+6 for DeepFilterNet3. Worker pools stay warm between runs, and the page preloads
+ffmpeg and the default engine while you're still picking a file.
 
 Both are 48 kHz fullband (no muffled highs) and language-agnostic — they model the
 acoustics of human voice, not any particular language, so Hindi and other languages
@@ -31,9 +37,13 @@ sync is sample-exact and the strength slider never comb-filters.
 
 ## Features
 
-- Drag & drop a video (MP4 / MOV / MKV / WebM) or an audio file (MP3 / WAV / M4A / …)
-- Two engines: fast (RNNoise) and high quality (DeepFilterNet3), pick per file
-- iMovie-style A/B switch to preview original vs. denoised while playing
+- Drag & drop a video (MP4 / MOV / MKV / WebM) or an audio file (MP3 / WAV / M4A / …) —
+  the video shows immediately and processing starts automatically
+- Two engines: fast (RNNoise) and high quality (DeepFilterNet3); switching re-processes
+- **Instant iMovie-style A/B switch**: original and processed files play in two
+  synchronized players, and the switch just swaps which one is audible — flick it
+  mid-playback with zero glitch
+- Live progress bar with stage and percentage
 - Strength slider (0–100%) — changing it after processing only re-mixes and re-muxes,
   it doesn't re-run the denoiser
 - Download the result (video codec bit-identical to the input)
@@ -82,10 +92,15 @@ reproduce: `bash scripts/build-dfn3-wasm.sh` (needs rustup + wasm-pack).
 
 ## Notes
 
-- **CPU vs WebGPU:** both engines are small enough that WASM SIMD on one CPU core is
-  already faster than realtime — WebGPU would add transfer latency, not speed. The
-  page detects and reports WebGPU availability; a WebGPU backend (e.g. onnxruntime-web)
-  only becomes worthwhile for much larger models.
+- **CPU vs WebGPU:** these are small *streaming* models — each 10 ms frame depends on
+  the previous frame's recurrent state, so a GPU can't batch frames within one stream,
+  and per-frame GPU dispatch overhead (~0.1–1 ms) would rival the compute itself.
+  The parallelism that *is* available (independent chunks of the timeline) is
+  exploited across CPU cores with Web Workers instead. On top of that, the DFN3 build
+  uses tract (CPU-only Rust inference); a WebGPU path would mean onnxruntime-web plus
+  reimplementing DFN3's STFT/ERB/deep-filter DSP in JS — lots of surface for little
+  or negative gain at this model size. WebGPU becomes the right tool for much bigger
+  models (Demucs-class), which don't fit a static-page budget anyway.
 - Audio is processed as stereo 48 kHz; mono inputs are upmixed, so output audio is
   always stereo.
 - Files are held in memory (ffmpeg.wasm virtual FS), so very large files

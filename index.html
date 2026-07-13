@@ -12,9 +12,9 @@
   <main class="wrap">
     <header>
       <h1>Shaant <span class="hindi" title="shaant — quiet">शांत</span></h1>
-      <p class="sub">Remove background noise from a video — like iMovie's one-switch noise reduction, but in your browser. Nothing is uploaded; everything runs locally.</p>
+      <p class="sub">Remove background noise from a video — right in your browser. Drop a file, wait a moment, then flick the switch while it plays. Nothing is uploaded.</p>
       <div class="badges">
-        <span class="badge" id="engineBadge">Engine: RNNoise · WASM SIMD (CPU)</span>
+        <span class="badge" id="engineBadge">Engine</span>
         <span class="badge" id="gpuBadge">WebGPU: checking…</span>
       </div>
     </header>
@@ -22,60 +22,54 @@
     <section class="card" id="dropZone">
       <input type="file" id="fileInput" accept="video/*,audio/*,.mkv,.mov,.mp4,.webm,.m4v,.avi,.mp3,.wav,.m4a,.flac,.ogg" hidden />
       <div class="drop-inner">
-        <div class="drop-icon">🎬</div>
-        <p><strong>Drop a video here</strong> or <button class="linklike" id="pickBtn">choose a file</button></p>
-        <p class="hint">MP4 / MOV / MKV / WebM — audio files work too. Stays on your device.</p>
+        <p id="dropTitle"><span class="drop-icon">🎬</span> <strong>Drop a video here</strong> or <button class="linklike" id="pickBtn">choose a file</button></p>
+        <p class="hint" id="dropHint">MP4 / MOV / MKV / WebM — audio files work too. Stays on your device.</p>
         <p class="file-info" id="fileInfo" hidden></p>
       </div>
     </section>
 
-    <section class="card controls" id="controlsCard" hidden>
-      <div class="engine-row">
-        <label class="engine-opt">
-          <input type="radio" name="engine" value="rnnoise" checked />
-          <span><strong>Fast</strong> — RNNoise. Seconds. Great for steady noise: fans, hiss, hum, AC.</span>
+    <section class="card video-card" id="videoCard" hidden data-state="idle">
+      <div class="ab-row">
+        <span class="ab-label" id="abLabelOrig">Original</span>
+        <label class="switch">
+          <input type="checkbox" id="abToggle" checked disabled />
+          <span class="slider"></span>
         </label>
-        <label class="engine-opt">
-          <input type="radio" name="engine" value="dfn3" />
-          <span><strong>High quality</strong> — DeepFilterNet3. Slower, much better with traffic, horns, babble. +17&nbsp;MB download.</span>
-        </label>
+        <span class="ab-label" id="abLabelDen">Noise&nbsp;removed</span>
+        <span class="status-chip" id="statusChip">Waiting…</span>
       </div>
-      <div class="controls-bottom">
+      <div class="bar-track" id="barTrack" hidden><div class="bar" id="bar"></div></div>
+
+      <div class="player-shell">
+        <video id="player" playsinline preload="metadata"></video>
+        <video id="shadowPlayer" playsinline preload="auto" style="display:none"></video>
+        <div class="transport">
+          <button id="playBtn" title="Play/Pause">▶</button>
+          <input type="range" id="seek" min="0" max="1000" value="0" />
+          <span id="timeLabel">0:00 / 0:00</span>
+        </div>
+      </div>
+      <p class="hint" id="playerHint" hidden></p>
+
+      <div class="tool-row">
+        <div class="engine-seg" role="radiogroup" aria-label="Engine">
+          <label><input type="radio" name="engine" value="rnnoise" checked /><span>Fast</span></label>
+          <label><input type="radio" name="engine" value="dfn3" /><span>High&nbsp;quality</span></label>
+        </div>
         <div class="control-row">
           <label for="strength">Strength</label>
           <input type="range" id="strength" min="0" max="100" value="100" />
           <span class="strength-val" id="strengthVal">100%</span>
         </div>
-        <button class="primary" id="processBtn">Remove noise</button>
+        <a class="primary download disabled" id="downloadBtn" download>Download</a>
       </div>
-    </section>
-
-    <section class="card progress-card" id="progressCard" hidden>
-      <p class="stage" id="stageLabel">Working…</p>
-      <div class="bar-track"><div class="bar" id="bar"></div></div>
+      <p class="hint engine-hint">Fast = RNNoise, great for steady noise (fans, hiss, AC) in seconds. High quality = DeepFilterNet3, much better with traffic, horns and babble — slower, +17 MB on first use. <span class="result-info" id="resultInfo"></span></p>
     </section>
 
     <section class="card error-card" id="errorBox" hidden></section>
 
-    <section class="card result" id="resultCard" hidden>
-      <div class="ab-row">
-        <span class="ab-label" id="abLabelOrig">Original</span>
-        <label class="switch">
-          <input type="checkbox" id="abToggle" checked />
-          <span class="slider"></span>
-        </label>
-        <span class="ab-label on" id="abLabelDen">Noise&nbsp;removed</span>
-      </div>
-      <video id="player" controls playsinline></video>
-      <p class="hint" id="playerHint" hidden></p>
-      <div class="result-actions">
-        <a class="primary download" id="downloadBtn" download>Download</a>
-        <span class="result-info" id="resultInfo"></span>
-      </div>
-    </section>
-
     <footer>
-      <p>Video stream is copied untouched — only the audio track is denoised and re-encoded. First run downloads ~36&nbsp;MB of WASM (cached afterwards). Best for files under ~500&nbsp;MB.</p>
+      <p>Video stream is copied untouched — only the audio track is denoised and re-encoded. Processing is parallelized across your CPU cores. First run downloads ~36 MB of WASM (cached afterwards). Best for files under ~500 MB.</p>
       <p>Built with <a href="https://github.com/xiph/rnnoise" target="_blank" rel="noopener">RNNoise</a>, <a href="https://github.com/Rikorose/DeepFilterNet" target="_blank" rel="noopener">DeepFilterNet3</a> and <a href="https://ffmpegwasm.netlify.app/" target="_blank" rel="noopener">ffmpeg.wasm</a>.</p>
     </footer>
   </main>

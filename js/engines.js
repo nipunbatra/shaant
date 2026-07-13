@@ -1,120 +1,184 @@
-// Denoise engines. Each engine exposes:
-//   label            — UI string
-//   async ensureLoaded(onStatus)
-//   async process(dryPcm, channels, onProgress) -> wetPcm (same length/layout)
-// PCM is interleaved Float32 in [-1, 1] at 48 kHz.
+// Parallel denoise orchestration. PCM is interleaved Float32 in [-1, 1] at 48 kHz.
+//
+// The audio is split per channel into ~6 s chunks and fanned out to a pool of
+// Web Workers (one wasm engine instance per worker). Each chunk is prefixed
+// with 1 s of "priming" audio so the recurrent model's state adapts before the
+// kept region starts, and consecutive kept regions are stitched with a 20 ms
+// crossfade. Pools are cached, so re-runs skip engine startup.
 
-const PCM_SCALE = 32768;
+const CHUNK = 288000;  // 6 s kept region per task
+const PRIME = 48000;   // 1 s state warm-up, discarded
+const XFADE = 960;     // 20 ms crossfade at chunk seams
 
-async function uiYield() {
-  return new Promise((r) => setTimeout(r, 0));
+export const ENGINE_INFO = {
+  rnnoise: { label: "RNNoise · WASM SIMD (CPU)", short: "RNNoise", maxWorkers: 8 },
+  dfn3: { label: "DeepFilterNet3 · WASM SIMD (CPU)", short: "DeepFilterNet3", maxWorkers: 6 },
+};
+
+const MODEL_URL = new URL("../vendor/deepfilternet/DeepFilterNet3_onnx.tar.gz", import.meta.url).href;
+
+class WorkerPool {
+  constructor(engineId, size) {
+    this.engineId = engineId;
+    this.size = size;
+    this.workers = [];
+  }
+
+  async init() {
+    const spawns = [];
+    for (let i = 0; i < this.size; i++) {
+      const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+      this.workers.push(w);
+      spawns.push(new Promise((resolve, reject) => {
+        w.onmessage = (e) => {
+          if (e.data.type === "ready") resolve();
+          else if (e.data.type === "error") reject(new Error(e.data.message));
+        };
+        w.onerror = (e) => reject(new Error("worker failed to start: " + e.message));
+        w.postMessage({ type: "init", engine: this.engineId, modelURL: MODEL_URL });
+      }));
+    }
+    await Promise.all(spawns);
+  }
+
+  // tasks: [{ id, data: Float32Array }] — data buffers are transferred.
+  // onTaskProgress(id, doneSamples), resolves to Map(id -> Float32Array)
+  run(tasks, onTaskProgress) {
+    return new Promise((resolve, reject) => {
+      const results = new Map();
+      const queue = tasks.slice();
+      let failed = false;
+
+      const feed = (w) => {
+        const t = queue.shift();
+        if (!t) return;
+        w.__task = t.id;
+        w.postMessage({ type: "task", id: t.id, data: t.data }, [t.data.buffer]);
+      };
+
+      for (const w of this.workers) {
+        w.onerror = (e) => {
+          failed = true;
+          reject(new Error("worker crashed: " + e.message));
+        };
+        w.onmessage = (e) => {
+          if (failed) return;
+          const m = e.data;
+          if (m.type === "progress") {
+            onTaskProgress?.(m.id, m.done);
+          } else if (m.type === "result") {
+            results.set(m.id, m.out);
+            onTaskProgress?.(m.id, m.out.length);
+            if (results.size === tasks.length) resolve(results);
+            else feed(w);
+          } else if (m.type === "error") {
+            failed = true;
+            reject(new Error(m.message));
+          }
+        };
+      }
+      this.workers.forEach(feed);
+    });
+  }
+
+  dispose() {
+    this.workers.forEach((w) => w.terminate());
+    this.workers = [];
+  }
 }
 
-// ---------- RNNoise (fast, ~100x realtime) ----------
+const pools = {};
 
-export const rnnoiseEngine = {
-  id: "rnnoise",
-  label: "RNNoise · WASM SIMD (CPU)",
-  _rnnoise: null,
+export async function getPool(engineId) {
+  if (pools[engineId]) return pools[engineId];
+  const cores = navigator.hardwareConcurrency || 4;
+  const size = Math.max(1, Math.min(ENGINE_INFO[engineId].maxWorkers, cores - 1));
+  const pool = new WorkerPool(engineId, size);
+  await pool.init();
+  pools[engineId] = pool;
+  return pool;
+}
 
-  async ensureLoaded(onStatus) {
-    if (this._rnnoise) return;
-    onStatus("Loading RNNoise…");
-    const { Rnnoise } = await import("../vendor/rnnoise/rnnoise.js");
-    this._rnnoise = await Rnnoise.load();
-  },
+export async function denoiseParallel(engineId, dry, channels, onProgress) {
+  const pool = await getPool(engineId);
+  const n = Math.floor(dry.length / channels);
 
-  async process(dry, channels, onProgress) {
-    const rn = this._rnnoise;
-    const frameSize = rn.frameSize; // 480 samples = 10 ms
-    const samplesPerCh = Math.floor(dry.length / channels);
-    const wet = new Float32Array(dry.length);
-    const frame = new Float32Array(frameSize);
-    const totalFrames = Math.ceil(samplesPerCh / frameSize) * channels;
-    let done = 0;
+  // deinterleave
+  const chans = [];
+  for (let c = 0; c < channels; c++) {
+    const a = new Float32Array(n);
+    for (let i = 0, j = c; i < n; i++, j += channels) a[i] = dry[j];
+    chans.push(a);
+  }
 
-    for (let ch = 0; ch < channels; ch++) {
-      const state = rn.createDenoiseState();
-      try {
-        for (let off = 0; off < samplesPerCh; off += frameSize) {
-          const len = Math.min(frameSize, samplesPerCh - off);
-          for (let i = 0; i < len; i++) frame[i] = dry[(off + i) * channels + ch] * PCM_SCALE;
-          if (len < frameSize) frame.fill(0, len);
-          state.processFrame(frame); // in-place, expects 16-bit range
-          for (let i = 0; i < len; i++) wet[(off + i) * channels + ch] = frame[i] / PCM_SCALE;
-          if (++done % 500 === 0) {
-            onProgress(done / totalFrames);
-            await uiYield();
-          }
-        }
-      } finally {
-        state.destroy();
+  // build tasks: each covers [keepStart, keepEnd) plus prime/crossfade lead-in
+  const numChunks = Math.max(1, Math.ceil(n / CHUNK));
+  const tasks = [];
+  const meta = [];
+  for (let c = 0; c < channels; c++) {
+    for (let k = 0; k < numChunks; k++) {
+      const keepStart = k * CHUNK;
+      const keepEnd = Math.min(n, (k + 1) * CHUNK);
+      let data, keepOffset;
+      if (k === 0) {
+        // synthetic prime: process the opening second twice, discard the first pass
+        const p = Math.min(PRIME, n);
+        data = new Float32Array(p + keepEnd);
+        data.set(chans[c].subarray(0, p), 0);
+        data.set(chans[c].subarray(0, keepEnd), p);
+        keepOffset = p;
+      } else {
+        const procStart = Math.max(0, keepStart - PRIME - XFADE);
+        data = chans[c].slice(procStart, keepEnd);
+        keepOffset = keepStart - XFADE - procStart;
       }
+      const id = tasks.length;
+      tasks.push({ id, data });
+      meta.push({ id, ch: c, k, keepStart, keepEnd, keepOffset, len: data.length });
     }
-    onProgress(1);
-    return wet;
-  },
-};
+  }
 
-// ---------- DeepFilterNet3 (high quality, slower) ----------
+  // progress across all tasks
+  const totalSamples = meta.reduce((s, m) => s + m.len, 0);
+  const taskDone = new Array(tasks.length).fill(0);
+  const results = await pool.run(tasks, (id, done) => {
+    taskDone[id] = Math.min(done, meta[id].len);
+    onProgress?.(taskDone.reduce((a, b) => a + b, 0) / totalSamples);
+  });
 
-export const dfn3Engine = {
-  id: "dfn3",
-  label: "DeepFilterNet3 · WASM SIMD (CPU)",
-  _mod: null,
-  _model: null,
-
-  async ensureLoaded(onStatus) {
-    if (this._mod) return;
-    onStatus("Loading DeepFilterNet3 (~17 MB, cached after first run)…");
-    const mod = await import("../vendor/deepfilternet/df.js");
-    await mod.default(); // instantiate wasm
-    const resp = await fetch(new URL("../vendor/deepfilternet/DeepFilterNet3_onnx.tar.gz", import.meta.url));
-    if (!resp.ok) throw new Error("Could not fetch DeepFilterNet3 model");
-    this._model = new Uint8Array(await resp.arrayBuffer());
-    this._mod = mod;
-  },
-
-  async process(dry, channels, onProgress) {
-    const { df_create, df_get_frame_length, df_process_frame, df_free } = this._mod;
-    const samplesPerCh = Math.floor(dry.length / channels);
-    const wet = new Float32Array(dry.length);
-    let done = 0;
-
-    for (let ch = 0; ch < channels; ch++) {
-      // one state per channel: the model carries temporal context
-      const st = df_create(this._model, 100);
-      try {
-        const hop = df_get_frame_length(st);
-        const frame = new Float32Array(hop);
-        const totalFrames = Math.ceil(samplesPerCh / hop) * channels;
-        for (let off = 0; off < samplesPerCh; off += hop) {
-          const len = Math.min(hop, samplesPerCh - off);
-          for (let i = 0; i < len; i++) frame[i] = dry[(off + i) * channels + ch];
-          if (len < hop) frame.fill(0, len);
-          const out = df_process_frame(st, frame);
-          for (let i = 0; i < len; i++) wet[(off + i) * channels + ch] = out[i];
-          if (++done % 25 === 0) {
-            onProgress(done / totalFrames);
-            await uiYield();
-          }
-        }
-      } finally {
-        if (df_free) df_free(st);
+  // merge in order (crossfade needs the previous chunk's tail in place)
+  const wetChans = chans.map(() => new Float32Array(n));
+  meta.sort((a, b) => a.ch - b.ch || a.k - b.k);
+  for (const m of meta) {
+    const out = results.get(m.id);
+    const wet = wetChans[m.ch];
+    if (m.k === 0) {
+      wet.set(out.subarray(m.keepOffset), 0);
+    } else {
+      const xf = Math.min(XFADE, m.keepStart); // safety, always XFADE in practice
+      for (let i = 0; i < xf; i++) {
+        const pos = m.keepStart - xf + i;
+        const w = i / xf;
+        wet[pos] = wet[pos] * (1 - w) + out[m.keepOffset + i] * w;
       }
+      wet.set(out.subarray(m.keepOffset + xf), m.keepStart);
     }
-    onProgress(1);
-    return wet;
-  },
-};
+  }
 
-export const engines = { rnnoise: rnnoiseEngine, dfn3: dfn3Engine };
+  // re-interleave
+  const wet = new Float32Array(dry.length);
+  for (let c = 0; c < channels; c++) {
+    const a = wetChans[c];
+    for (let i = 0, j = c; i < n; i++, j += channels) wet[j] = a[i];
+  }
+  return { wet, workers: pool.size };
+}
 
 // ---------- delay compensation ----------
 
-// Denoisers introduce a small algorithmic delay (RNNoise ~10 ms). Estimate it by
-// cross-correlating dry vs wet on a strided window, so strength-mixing doesn't
-// comb-filter and A/V sync stays exact.
+// Denoisers introduce a small algorithmic delay (RNNoise ~20 ms, DFN3 ~30 ms).
+// Estimate it by cross-correlating dry vs wet on a strided window, so
+// strength-mixing doesn't comb-filter and A/V sync stays exact.
 export function measureDelay(dry, wet, channels, maxLag = 4800) {
   const n = Math.min(Math.floor(dry.length / channels), 48000 * 10);
   const stride = 8;
