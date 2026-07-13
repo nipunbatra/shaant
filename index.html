@@ -6,7 +6,7 @@
   <title>Shaant — remove background noise from video, in your browser</title>
   <meta name="description" content="Shaant (शांत) removes background noise from your videos entirely in the browser — nothing is uploaded. RNNoise for speed, DeepFilterNet3 for quality." />
   <link rel="stylesheet" href="styles.css" />
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤫</text></svg>" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%237c5cff'/><g stroke='white' stroke-width='5' stroke-linecap='round'><line x1='14' y1='26' x2='14' y2='38'/><line x1='24' y1='18' x2='24' y2='46'/><line x1='34' y1='24' x2='34' y2='40'/><line x1='44' y1='29' x2='44' y2='35'/><line x1='54' y1='31' x2='54' y2='33'/></g></svg>" />
 </head>
 <body>
   <main class="wrap">
@@ -22,7 +22,7 @@
     <section class="card" id="dropZone">
       <input type="file" id="fileInput" accept="video/*,audio/*,.mkv,.mov,.mp4,.webm,.m4v,.avi,.mp3,.wav,.m4a,.flac,.ogg" hidden />
       <div class="drop-inner">
-        <p id="dropTitle"><span class="drop-icon">🎬</span> <strong>Drop a video here</strong> or <button class="linklike" id="pickBtn">choose a file</button></p>
+        <p id="dropTitle"><strong>Drop a video here</strong> or <button class="linklike" id="pickBtn">choose a file</button></p>
         <p class="hint" id="dropHint">MP4 / MOV / MKV / WebM — audio files work too. Stays on your device.</p>
         <p class="file-info" id="fileInfo" hidden></p>
       </div>
@@ -59,7 +59,7 @@
         <video id="player" playsinline preload="metadata"></video>
         <video id="shadowPlayer" playsinline preload="auto" style="display:none"></video>
         <div class="transport">
-          <button id="playBtn" title="Play/Pause">▶</button>
+          <button id="playBtn" title="Play/Pause" aria-label="Play"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M2 1l9 5-9 5z"/></svg></button>
           <input type="range" id="seek" min="0" max="1000" value="0" />
           <span id="timeLabel">0:00 / 0:00</span>
         </div>

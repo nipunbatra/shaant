@@ -75,7 +75,6 @@ header h1 .hindi {
 }
 #dropZone.dragover { border-color: var(--accent); background: #1b1e2b; }
 #dropZone.compact { padding: 10px 16px; }
-.drop-icon { font-size: 1.3rem; margin-right: 4px; }
 .drop-inner p { margin: 4px 0; }
 .hint { color: var(--muted); font-size: 0.85rem; }
 .file-info { color: var(--ok); font-size: 0.9rem; word-break: break-all; }

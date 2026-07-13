@@ -104,12 +104,14 @@ function init() {
   // custom transport controls (native controls would fight the mute-swap)
   els.playBtn.addEventListener("click", togglePlay);
   els.player.addEventListener("click", togglePlay);
+  const PLAY_ICON = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M2 1l9 5-9 5z"/></svg>';
+  const PAUSE_ICON = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="1" width="3" height="10"/><rect x="7" y="1" width="3" height="10"/></svg>';
   els.player.addEventListener("play", () => {
-    els.playBtn.textContent = "❚❚";
+    els.playBtn.innerHTML = PAUSE_ICON;
     if (processedReady) { syncShadow(); els.shadow.play().catch(() => {}); }
   });
   els.player.addEventListener("pause", () => {
-    els.playBtn.textContent = "▶";
+    els.playBtn.innerHTML = PLAY_ICON;
     els.shadow.pause();
   });
   els.player.addEventListener("seeked", syncShadow);
