@@ -25,20 +25,30 @@ class WorkerPool {
   }
 
   async init() {
-    const spawns = [];
-    for (let i = 0; i < this.size; i++) {
+    // fetch the DFN3 model once and copy bytes to each worker — otherwise N
+    // cold-cache workers each download the 8 MB tar.gz in parallel
+    let model = null;
+    if (this.engineId === "dfn3") {
+      const resp = await fetch(MODEL_URL);
+      if (!resp.ok) throw new Error("model fetch failed: " + resp.status);
+      model = new Uint8Array(await resp.arrayBuffer());
+    }
+    const spawn = () => {
       const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
       this.workers.push(w);
-      spawns.push(new Promise((resolve, reject) => {
+      return new Promise((resolve, reject) => {
         w.onmessage = (e) => {
           if (e.data.type === "ready") resolve();
           else if (e.data.type === "error") reject(new Error(e.data.message));
         };
         w.onerror = (e) => reject(new Error("worker failed to start: " + e.message));
-        w.postMessage({ type: "init", engine: this.engineId, modelURL: MODEL_URL });
-      }));
-    }
-    await Promise.all(spawns);
+        w.postMessage({ type: "init", engine: this.engineId, model });
+      });
+    };
+    // first worker alone, so its module/wasm downloads land in the HTTP cache
+    // before the rest spawn; then the remainder start in parallel
+    await spawn();
+    await Promise.all(Array.from({ length: this.size - 1 }, spawn));
   }
 
   // tasks: [{ id, data: Float32Array }] — data buffers are transferred.

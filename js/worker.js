@@ -1,6 +1,6 @@
 // Module worker: runs one denoise engine over mono PCM chunks (48 kHz).
 // Protocol:
-//   -> { type:"init", engine:"rnnoise"|"dfn3", modelURL? }
+//   -> { type:"init", engine:"rnnoise"|"dfn3", model? (Uint8Array, dfn3 only) }
 //   <- { type:"ready" }
 //   -> { type:"task", id, data: Float32Array }
 //   <- { type:"progress", id, done }   (done = samples processed so far in this task)
@@ -27,10 +27,7 @@ self.onmessage = async (e) => {
       } else if (engineId === "dfn3") {
         dfMod = await import("../vendor/deepfilternet/df.js");
         await dfMod.default();
-        const resp = await fetch(msg.modelURL);
-        if (!resp.ok) throw new Error("model fetch failed: " + resp.status);
-        const model = new Uint8Array(await resp.arrayBuffer());
-        dfState = dfMod.df_create(model, 100);
+        dfState = dfMod.df_create(msg.model, 100);
         hop = dfMod.df_get_frame_length(dfState);
       } else {
         throw new Error("unknown engine " + engineId);
