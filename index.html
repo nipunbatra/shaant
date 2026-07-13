@@ -28,6 +28,21 @@
       </div>
     </section>
 
+    <section class="card settings-card">
+      <div class="tool-row">
+        <div class="engine-seg" role="radiogroup" aria-label="Engine">
+          <label><input type="radio" name="engine" value="dfn3" checked /><span>High&nbsp;quality</span></label>
+          <label><input type="radio" name="engine" value="rnnoise" /><span>Fast</span></label>
+        </div>
+        <div class="control-row">
+          <label for="strength">Strength</label>
+          <input type="range" id="strength" min="0" max="100" value="70" />
+          <span class="strength-val" id="strengthVal">70%</span>
+        </div>
+      </div>
+      <p class="hint engine-hint">High quality (default) = DeepFilterNet3 — handles traffic, horns, babble; +17&nbsp;MB on first use. Fast = RNNoise — steady noise (fans, hiss, AC) in seconds. 70% strength keeps a touch of natural ambience; 100% removes everything. Both can be changed any time — even mid-processing.</p>
+    </section>
+
     <section class="card video-card" id="videoCard" hidden data-state="idle">
       <div class="ab-row">
         <span class="ab-label" id="abLabelOrig">Original</span>
@@ -51,19 +66,10 @@
       </div>
       <p class="hint" id="playerHint" hidden></p>
 
-      <div class="tool-row">
-        <div class="engine-seg" role="radiogroup" aria-label="Engine">
-          <label><input type="radio" name="engine" value="rnnoise" checked /><span>Fast</span></label>
-          <label><input type="radio" name="engine" value="dfn3" /><span>High&nbsp;quality</span></label>
-        </div>
-        <div class="control-row">
-          <label for="strength">Strength</label>
-          <input type="range" id="strength" min="0" max="100" value="100" />
-          <span class="strength-val" id="strengthVal">100%</span>
-        </div>
+      <div class="result-row">
         <a class="primary download disabled" id="downloadBtn" download>Download</a>
+        <span class="result-info" id="resultInfo"></span>
       </div>
-      <p class="hint engine-hint">Fast = RNNoise, great for steady noise (fans, hiss, AC) in seconds. High quality = DeepFilterNet3, much better with traffic, horns and babble — slower, +17 MB on first use. <span class="result-info" id="resultInfo"></span></p>
     </section>
 
     <section class="card error-card" id="errorBox" hidden></section>

@@ -72,23 +72,40 @@ with sync_playwright() as p:
     page.wait_for_selector("#dropZone", timeout=10000)
     print("PAGE LOADED, badges:", page.locator(".badges").inner_text().replace("\n", " | "))
 
-    # dropping a file auto-starts processing with the Fast engine
+    # defaults: High quality (dfn3) at 70% — check they're preselected
+    assert page.evaluate("() => document.querySelector('input[name=engine]:checked').value") == "dfn3"
+    assert page.evaluate("() => document.getElementById('strength').value") == "70"
+    print("DEFAULTS OK (dfn3 @ 70%)")
+
+    if ENGINE == "rnnoise":
+        # engine is choosable BEFORE dropping a file now
+        page.check('input[name="engine"][value="rnnoise"]', force=True)
+
+    # dropping a file auto-starts processing with the selected engine
     page.set_input_files("#fileInput", NOISY)
     page.wait_for_selector("#videoCard:not([hidden])", timeout=5000)
-    wait_ready(page)
-    print("FAST DONE:", page.locator("#resultInfo").inner_text())
 
     if ENGINE == "dfn3":
-        # switching engine re-processes automatically
-        page.check('input[name="engine"][value="dfn3"]', force=True)
+        # switching engine MID-processing must cancel and restart cleanly
         page.wait_for_function(
             "() => document.getElementById('videoCard').dataset.state === 'processing'",
             timeout=10000,
         )
+        page.check('input[name="engine"][value="rnnoise"]', force=True)
+        wait_ready(page)
+        info = page.locator("#resultInfo").inner_text()
+        assert "RNNoise" in info, f"expected RNNoise after mid-run switch, got: {info}"
+        print("MID-RUN SWITCH OK:", info)
+        page.check('input[name="engine"][value="dfn3"]', force=True)
         wait_ready(page)
         info = page.locator("#resultInfo").inner_text()
         assert "DeepFilterNet3" in info, f"expected DFN3 result, got: {info}"
         print("HQ DONE:", info)
+    else:
+        wait_ready(page)
+        info = page.locator("#resultInfo").inner_text()
+        assert "RNNoise" in info, f"expected RNNoise result, got: {info}"
+        print("FAST DONE:", info)
 
     print("DOWNLOAD NAME:", page.locator("#downloadBtn").get_attribute("download"))
 

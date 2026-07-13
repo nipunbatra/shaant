@@ -1,5 +1,5 @@
 import { FFmpeg } from "../vendor/ffmpeg/index.js";
-import { ENGINE_INFO, getPool, denoiseParallel, measureDelay, compensateDelay } from "./engines.js";
+import { ENGINE_INFO, getPool, denoiseParallel, cancelEngineRun, measureDelay, compensateDelay } from "./engines.js";
 
 const SR = 48000;  // both engines operate at 48 kHz
 const CH = 2;      // process everything as stereo
@@ -31,9 +31,24 @@ let originalURL = null;
 let processedURL = null;
 let processedReady = false;
 let busy = false;
-let runSeq = 0;              // invalidates in-flight runs when a new file lands
+let runSeq = 0;              // invalidates in-flight runs when a new file/engine lands
+let denoiseRun = null;       // { seq, engineId } while a pool run is in flight
 let logTail = [];
 let ffStage = false;         // route ffmpeg progress events to the bar
+let ffLock = Promise.resolve(); // serializes ffmpeg use across overlapping runs
+
+function withFF(fn) {
+  const p = ffLock.then(fn);
+  ffLock = p.catch(() => {});
+  return p;
+}
+
+function cancelActiveDenoise() {
+  if (denoiseRun) {
+    cancelEngineRun(denoiseRun.engineId);
+    denoiseRun = null;
+  }
+}
 
 init();
 
@@ -56,11 +71,11 @@ function init() {
     if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
   });
 
-  // engine switch re-processes the current file
+  // engine switch re-processes the current file — even mid-run (cancels it)
   document.querySelectorAll('input[name="engine"]').forEach((radio) =>
     radio.addEventListener("change", () => {
       updateEngineBadge();
-      if (currentFile && !busy) processCurrent();
+      if (currentFile) processCurrent();
     }));
 
   els.strength.addEventListener("input", () => {
@@ -158,7 +173,6 @@ function applyAB() {
 }
 
 function setFile(file) {
-  if (busy && file === currentFile) return;
   runSeq++;
   currentFile = file;
   dryPcm = wetPcm = null;
@@ -219,6 +233,7 @@ function ensureFFmpeg() {
 
 async function processCurrent() {
   if (!currentFile) return;
+  cancelActiveDenoise();
   const seq = ++runSeq;
   const engineId = selectedEngineId();
   const info = ENGINE_INFO[engineId];
@@ -226,6 +241,7 @@ async function processCurrent() {
   els.videoCard.dataset.state = "processing";
   els.errorBox.hidden = true;
   processedReady = false;
+  appliedStrength = -1; // engine re-runs must re-export even at the same strength
   els.abToggle.disabled = true;
   applyAB();
   const t0 = performance.now();
@@ -239,36 +255,46 @@ async function processCurrent() {
     ]);
     if (seq !== runSeq) return;
 
-    const ext = (currentFile.name.split(".").pop() || "").toLowerCase();
-    if (inputFsName) { try { await ffmpeg.deleteFile(inputFsName); } catch {} }
-    inputFsName = "in." + (/^[a-z0-9]{1,5}$/.test(ext) ? ext : "dat");
-    await ffmpeg.writeFile(inputFsName, new Uint8Array(bytes));
-
     setStatus("Extracting audio…");
-    hasVideo = false;
-    logTail = [];
-    ffStage = true;
-    const ret = await ffmpeg.exec([
-      "-i", inputFsName, "-vn", "-sn", "-dn", "-map", "0:a:0",
-      "-ac", String(CH), "-ar", String(SR),
-      "-f", "f32le", "-c:a", "pcm_f32le", "audio.f32",
-    ]);
-    ffStage = false;
-    if (seq !== runSeq) return;
-    if (ret !== 0) {
-      throw new Error("Could not extract audio — does the file have an audio track?\n\n" + logTail.slice(-6).join("\n"));
-    }
-    const raw = await ffmpeg.readFile("audio.f32");
-    await ffmpeg.deleteFile("audio.f32");
+    const raw = await withFF(async () => {
+      if (seq !== runSeq) return null;
+      const ext = (currentFile.name.split(".").pop() || "").toLowerCase();
+      if (inputFsName) { try { await ffmpeg.deleteFile(inputFsName); } catch {} }
+      inputFsName = "in." + (/^[a-z0-9]{1,5}$/.test(ext) ? ext : "dat");
+      await ffmpeg.writeFile(inputFsName, new Uint8Array(bytes));
+      hasVideo = false;
+      logTail = [];
+      ffStage = true;
+      const ret = await ffmpeg.exec([
+        "-i", inputFsName, "-vn", "-sn", "-dn", "-map", "0:a:0",
+        "-ac", String(CH), "-ar", String(SR),
+        "-f", "f32le", "-c:a", "pcm_f32le", "audio.f32",
+      ]);
+      ffStage = false;
+      if (ret !== 0) {
+        throw new Error("Could not extract audio — does the file have an audio track?\n\n" + logTail.slice(-6).join("\n"));
+      }
+      const data = await ffmpeg.readFile("audio.f32");
+      await ffmpeg.deleteFile("audio.f32");
+      return data;
+    });
+    if (seq !== runSeq || !raw) return;
     dryPcm = new Float32Array(raw.byteLength >> 2);
     new Uint8Array(dryPcm.buffer).set(raw);
 
-    const { wet, workers } = await denoiseParallel(engineId, dryPcm, CH, (r) => {
-      if (seq === runSeq) {
-        setStatus(`Removing noise (${info.short}) · ${workersLabel(engineId)}… ${Math.round(r * 100)}%`);
-        setBar(r);
-      }
-    });
+    denoiseRun = { seq, engineId };
+    let denoised;
+    try {
+      denoised = await denoiseParallel(engineId, dryPcm, CH, (r) => {
+        if (seq === runSeq) {
+          setStatus(`Removing noise (${info.short}) · ${workersLabel(engineId)}… ${Math.round(r * 100)}%`);
+          setBar(r);
+        }
+      });
+    } finally {
+      if (denoiseRun?.seq === seq) denoiseRun = null;
+    }
+    const { wet, workers } = denoised;
     if (seq !== runSeq) return;
 
     const delay = measureDelay(dryPcm, wet, CH);
@@ -276,7 +302,12 @@ async function processCurrent() {
     wetPcm = compensateDelay(wet, CH, delay);
 
     setStatus(hasVideo ? "Rebuilding video…" : "Rebuilding audio…", true);
-    await exportWithStrength(Number(els.strength.value) / 100);
+    // strength can be adjusted while processing runs — catch up if it moved mid-export
+    let want = Number(els.strength.value) / 100;
+    while (seq === runSeq && want !== appliedStrength) {
+      await exportWithStrength(want);
+      want = Number(els.strength.value) / 100;
+    }
     if (seq !== runSeq) return;
 
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
@@ -311,44 +342,46 @@ async function exportWithStrength(strength) {
       mixed[i] = dryPcm[i] + (wetPcm[i] - dryPcm[i]) * strength;
     }
   }
-  // writeFile transfers the buffer to the ffmpeg worker (detaching it), so hand it a copy —
-  // wetPcm/dryPcm must survive for later strength re-exports
-  await ffmpeg.writeFile("denoised.f32", new Uint8Array(mixed.buffer, mixed.byteOffset, mixed.byteLength).slice());
+  const { data, output } = await withFF(async () => {
+    // writeFile transfers the buffer to the ffmpeg worker (detaching it), so hand it a copy —
+    // wetPcm/dryPcm must survive for later strength re-exports
+    await ffmpeg.writeFile("denoised.f32", new Uint8Array(mixed.buffer, mixed.byteOffset, mixed.byteLength).slice());
 
-  const inputExt = inputFsName.split(".").pop();
-  const rawArgs = ["-f", "f32le", "-ar", String(SR), "-ac", String(CH), "-i", "denoised.f32"];
-  const attempts = [];
-  if (!hasVideo) {
-    attempts.push({ ext: "m4a", mime: "audio/mp4",
-      args: ["-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"] });
-  } else {
-    const videoCopy = ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"];
-    if (inputExt === "webm") {
-      attempts.push({ ext: "webm", mime: "video/webm", args: [...videoCopy, "-c:a", "libopus", "-b:a", "128k"] });
+    const inputExt = inputFsName.split(".").pop();
+    const rawArgs = ["-f", "f32le", "-ar", String(SR), "-ac", String(CH), "-i", "denoised.f32"];
+    const attempts = [];
+    if (!hasVideo) {
+      attempts.push({ ext: "m4a", mime: "audio/mp4",
+        args: ["-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"] });
+    } else {
+      const videoCopy = ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"];
+      if (inputExt === "webm") {
+        attempts.push({ ext: "webm", mime: "video/webm", args: [...videoCopy, "-c:a", "libopus", "-b:a", "128k"] });
+      }
+      attempts.push({ ext: "mp4", mime: "video/mp4",
+        args: [...videoCopy, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"] });
+      attempts.push({ ext: "mkv", mime: "video/x-matroska", args: [...videoCopy, "-c:a", "aac", "-b:a", "192k"] });
     }
-    attempts.push({ ext: "mp4", mime: "video/mp4",
-      args: [...videoCopy, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"] });
-    attempts.push({ ext: "mkv", mime: "video/x-matroska", args: [...videoCopy, "-c:a", "aac", "-b:a", "192k"] });
-  }
 
-  let output = null;
-  for (const att of attempts) {
-    const outName = "out." + att.ext;
-    logTail = [];
-    const ret = await ffmpeg.exec(["-i", inputFsName, ...rawArgs, ...att.args, "-y", outName]);
-    if (ret === 0) {
-      output = { name: outName, ...att };
-      break;
+    let out = null;
+    for (const att of attempts) {
+      const outName = "out." + att.ext;
+      logTail = [];
+      const ret = await ffmpeg.exec(["-i", inputFsName, ...rawArgs, ...att.args, "-y", outName]);
+      if (ret === 0) {
+        out = { name: outName, ...att };
+        break;
+      }
+      try { await ffmpeg.deleteFile(outName); } catch {}
     }
-    try { await ffmpeg.deleteFile(outName); } catch {}
-  }
-  await ffmpeg.deleteFile("denoised.f32");
-  if (!output) {
-    throw new Error("Could not rebuild the file.\n\n" + logTail.slice(-6).join("\n"));
-  }
-
-  const data = await ffmpeg.readFile(output.name);
-  await ffmpeg.deleteFile(output.name);
+    await ffmpeg.deleteFile("denoised.f32");
+    if (!out) {
+      throw new Error("Could not rebuild the file.\n\n" + logTail.slice(-6).join("\n"));
+    }
+    const d = await ffmpeg.readFile(out.name);
+    await ffmpeg.deleteFile(out.name);
+    return { data: d, output: out };
+  });
   const blob = new Blob([data], { type: output.mime });
   if (processedURL) URL.revokeObjectURL(processedURL);
   processedURL = URL.createObjectURL(blob);
@@ -376,8 +409,6 @@ async function exportWithStrength(strength) {
 
 function setBusy(b) {
   busy = b;
-  document.querySelectorAll('input[name="engine"]').forEach((r) => { r.disabled = b; });
-  els.strength.disabled = b;
   els.barTrack.hidden = !b;
 }
 

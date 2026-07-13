@@ -39,7 +39,11 @@ sync is sample-exact and the strength slider never comb-filters.
 
 - Drag & drop a video (MP4 / MOV / MKV / WebM) or an audio file (MP3 / WAV / M4A / …) —
   the video shows immediately and processing starts automatically
-- Two engines: fast (RNNoise) and high quality (DeepFilterNet3); switching re-processes
+- Engine and strength are selectable **before** dropping a file; defaults to
+  **DeepFilterNet3 at 70%** (a touch of natural ambience is kept — set 100% for
+  maximum removal)
+- Switching engines mid-processing cancels the in-flight run (worker pool is
+  terminated) and restarts with the new engine
 - **Instant iMovie-style A/B switch**: original and processed files play in two
   synchronized players, and the switch just swaps which one is audible — flick it
   mid-playback with zero glitch

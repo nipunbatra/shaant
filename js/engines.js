@@ -55,6 +55,7 @@ class WorkerPool {
   // onTaskProgress(id, doneSamples), resolves to Map(id -> Float32Array)
   run(tasks, onTaskProgress) {
     return new Promise((resolve, reject) => {
+      this._activeReject = reject;
       const results = new Map();
       const queue = tasks.slice();
       let failed = false;
@@ -79,8 +80,10 @@ class WorkerPool {
           } else if (m.type === "result") {
             results.set(m.id, m.out);
             onTaskProgress?.(m.id, m.out.length);
-            if (results.size === tasks.length) resolve(results);
-            else feed(w);
+            if (results.size === tasks.length) {
+              this._activeReject = null;
+              resolve(results);
+            } else feed(w);
           } else if (m.type === "error") {
             failed = true;
             reject(new Error(m.message));
@@ -94,10 +97,25 @@ class WorkerPool {
   dispose() {
     this.workers.forEach((w) => w.terminate());
     this.workers = [];
+    if (this._activeReject) {
+      const rej = this._activeReject;
+      this._activeReject = null;
+      rej(new Error("cancelled"));
+    }
   }
 }
 
 const pools = {};
+
+// Abort an in-flight run: terminate the pool's workers (the only way to stop a
+// busy wasm loop) and drop the pool so the next use spawns a fresh one.
+export function cancelEngineRun(engineId) {
+  const pool = pools[engineId];
+  if (pool && pool._activeReject) {
+    delete pools[engineId];
+    pool.dispose();
+  }
+}
 
 export async function getPool(engineId) {
   if (pools[engineId]) return pools[engineId];

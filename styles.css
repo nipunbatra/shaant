@@ -232,7 +232,9 @@ button.primary:hover, a.primary:hover { background: var(--accent-hover); }
 a.primary.disabled { opacity: 0.4; pointer-events: none; }
 
 .engine-hint { margin: 10px 0 0; }
-.result-info { color: var(--text); }
+.settings-card { padding: 16px 20px; }
+.result-row { display: flex; align-items: center; gap: 16px; margin-top: 14px; flex-wrap: wrap; }
+.result-info { color: var(--muted); font-size: 0.88rem; }
 
 /* Error */
 .error-card { border-color: #5b2530; color: var(--err); font-size: 0.9rem; white-space: pre-wrap; word-break: break-word; }
