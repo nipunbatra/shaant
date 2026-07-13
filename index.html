@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shaant — remove background noise from video, in your browser</title>
+  <meta name="description" content="Shaant (शांत) removes background noise from your videos entirely in the browser — nothing is uploaded. RNNoise for speed, DeepFilterNet3 for quality." />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤫</text></svg>" />
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1>Shaant <span class="hindi" title="shaant — quiet">शांत</span></h1>
+      <p class="sub">Remove background noise from a video — like iMovie's one-switch noise reduction, but in your browser. Nothing is uploaded; everything runs locally.</p>
+      <div class="badges">
+        <span class="badge" id="engineBadge">Engine: RNNoise · WASM SIMD (CPU)</span>
+        <span class="badge" id="gpuBadge">WebGPU: checking…</span>
+      </div>
+    </header>
+
+    <section class="card" id="dropZone">
+      <input type="file" id="fileInput" accept="video/*,audio/*,.mkv,.mov,.mp4,.webm,.m4v,.avi,.mp3,.wav,.m4a,.flac,.ogg" hidden />
+      <div class="drop-inner">
+        <div class="drop-icon">🎬</div>
+        <p><strong>Drop a video here</strong> or <button class="linklike" id="pickBtn">choose a file</button></p>
+        <p class="hint">MP4 / MOV / MKV / WebM — audio files work too. Stays on your device.</p>
+        <p class="file-info" id="fileInfo" hidden></p>
+      </div>
+    </section>
+
+    <section class="card controls" id="controlsCard" hidden>
+      <div class="engine-row">
+        <label class="engine-opt">
+          <input type="radio" name="engine" value="rnnoise" checked />
+          <span><strong>Fast</strong> — RNNoise. Seconds. Great for steady noise: fans, hiss, hum, AC.</span>
+        </label>
+        <label class="engine-opt">
+          <input type="radio" name="engine" value="dfn3" />
+          <span><strong>High quality</strong> — DeepFilterNet3. Slower, much better with traffic, horns, babble. +17&nbsp;MB download.</span>
+        </label>
+      </div>
+      <div class="controls-bottom">
+        <div class="control-row">
+          <label for="strength">Strength</label>
+          <input type="range" id="strength" min="0" max="100" value="100" />
+          <span class="strength-val" id="strengthVal">100%</span>
+        </div>
+        <button class="primary" id="processBtn">Remove noise</button>
+      </div>
+    </section>
+
+    <section class="card progress-card" id="progressCard" hidden>
+      <p class="stage" id="stageLabel">Working…</p>
+      <div class="bar-track"><div class="bar" id="bar"></div></div>
+    </section>
+
+    <section class="card error-card" id="errorBox" hidden></section>
+
+    <section class="card result" id="resultCard" hidden>
+      <div class="ab-row">
+        <span class="ab-label" id="abLabelOrig">Original</span>
+        <label class="switch">
+          <input type="checkbox" id="abToggle" checked />
+          <span class="slider"></span>
+        </label>
+        <span class="ab-label on" id="abLabelDen">Noise&nbsp;removed</span>
+      </div>
+      <video id="player" controls playsinline></video>
+      <p class="hint" id="playerHint" hidden></p>
+      <div class="result-actions">
+        <a class="primary download" id="downloadBtn" download>Download</a>
+        <span class="result-info" id="resultInfo"></span>
+      </div>
+    </section>
+
+    <footer>
+      <p>Video stream is copied untouched — only the audio track is denoised and re-encoded. First run downloads ~36&nbsp;MB of WASM (cached afterwards). Best for files under ~500&nbsp;MB.</p>
+      <p>Built with <a href="https://github.com/xiph/rnnoise" target="_blank" rel="noopener">RNNoise</a>, <a href="https://github.com/Rikorose/DeepFilterNet" target="_blank" rel="noopener">DeepFilterNet3</a> and <a href="https://ffmpegwasm.netlify.app/" target="_blank" rel="noopener">ffmpeg.wasm</a>.</p>
+    </footer>
+  </main>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
