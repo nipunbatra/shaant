@@ -27,7 +27,7 @@ self.onmessage = async (e) => {
       } else if (engineId === "dfn3") {
         dfMod = await import("../vendor/deepfilternet/df.js");
         await dfMod.default();
-        dfState = dfMod.df_create(msg.model, 100);
+        dfState = dfMod.df_create(msg.model, msg.attenuationLimit ?? 30);
         hop = dfMod.df_get_frame_length(dfState);
       } else {
         throw new Error("unknown engine " + engineId);

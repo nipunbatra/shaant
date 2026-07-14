@@ -12,6 +12,21 @@ const CHUNK = 384000; // 8 s kept region per task
 const PRIME = 48000;  // 1 s state warm-up, discarded
 const XFADE = 960;    // 20 ms crossfade at chunk seams
 
+export function parseAttenuationLimit(value, fallback = 30) {
+  if (value === null || value === undefined || String(value).trim() === "") return fallback;
+  const limit = Number(value);
+  return Number.isFinite(limit) ? Math.min(100, Math.max(12, limit)) : fallback;
+}
+
+// DFN's own ceiling is the first line of speech protection. The old 100 dB
+// setting allowed effectively unlimited spectral suppression; 30 dB still
+// removes strong ambience but bounds the damage from a mistaken speech mask.
+const DFN_ATTENUATION_LIMIT_DB = parseAttenuationLimit(
+  typeof location === "undefined"
+    ? null
+    : new URLSearchParams(location.search).get("dfn-limit"),
+);
+
 export const ENGINE_INFO = {
   rnnoise: { label: "RNNoise · WASM SIMD", short: "RNNoise", maxWorkers: 8 },
   dfn3: { label: "DeepFilterNet3 · WASM SIMD", short: "DeepFilterNet3", maxWorkers: 6 },
@@ -61,7 +76,12 @@ class WorkerPool {
           else if (event.data.type === "error") reject(new Error(event.data.message));
         };
         worker.onerror = (event) => reject(new Error("worker failed to start: " + event.message));
-        worker.postMessage({ type: "init", engine: this.engineId, model });
+        worker.postMessage({
+          type: "init",
+          engine: this.engineId,
+          model,
+          attenuationLimit: this.engineId === "dfn3" ? DFN_ATTENUATION_LIMIT_DB : null,
+        });
       });
     } catch (error) {
       worker.terminate();

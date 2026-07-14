@@ -49,6 +49,33 @@ product pass.
 - **Microscopic final section:** floating container metadata could turn an exact boundary
   into a nearly empty extra model job. Sub-second rounding tails are merged into the prior
   bounded section by the shared, unit-tested segment planner.
+- **Section files still accumulated in WASM memory:** sectional PCM was bounded, but every
+  lossless cleaned part remained in MEMFS until the final mux. A long recording could still
+  exhaust the fixed WASM heap late in the run. Completed FLAC parts now spool to per-run
+  browser-origin private storage, are removed immediately from MEMFS, and are mounted
+  read-only for concat and strength re-exports. Per-part and second-mount fallbacks preserve
+  compatibility, while run tokens and scoped cleanup prevent one tab or cancelled job from
+  deleting another run's files.
+- **Missing browser duration metadata:** the old fallback risked decoding an unbounded file
+  before knowing whether sectional mode was required. A tiny ffmpeg header probe now obtains
+  duration and stream presence without allocating the full PCM timeline; an unprobeable file
+  over 128 MB fails safely instead of gambling on memory.
+- **Relative A/V start drift:** normalized replacement audio moved delayed audio to time zero,
+  changing lip sync even when total duration matched. A disposable probe worker measures the
+  first audio and video timestamps without leaking `-copyts` state into production ffmpeg;
+  both normal and sectional exports restore positive or negative relative offsets.
+- **Unweighted sectional Automatic strength:** a short tail could dictate the recommendation
+  for a much longer recording. Recommendations now use a duration-weighted conservative
+  percentile, so equal sections remain protective while tiny tails cannot dominate.
+- **Non-finite numeric inputs:** malformed metadata and PCM could propagate `NaN` or infinity
+  into memory planning, analysis and export. Planner inputs are validated, explicit zero
+  budgets are honored, frame analysis sanitizes samples, and cleanup output is always finite
+  and clamped to the encoder-safe float range.
+- **Real WebM decoder trap:** VP8/VP9 with Opus or Vorbis consistently triggered an upstream
+  `memory access out of bounds` trap in the current official ffmpeg.wasm core, even with
+  direct mounting and timestamp probing disabled. WebM is now rejected before processing
+  with actionable alternatives and a privacy assurance, leaving the page usable for another
+  file instead of crashing its media engine.
 
 ### Performance and quality changes
 
@@ -74,6 +101,9 @@ product pass.
 - Long-file staging does not create a browser-side whole-file `ArrayBuffer` at all. Per-section
   raw PCM is deleted immediately after its lossless cleaned section is written, keeping peak
   JavaScript PCM memory duration-independent.
+- Lossless section storage is also duration-independent inside the WASM heap: after each FLAC
+  part reaches private browser storage, its MEMFS copy is deleted. Only the final muxed result
+  remains whole in ffmpeg's virtual filesystem.
 - Progress aggregation is now O(1) per worker message instead of repeatedly reducing the
   whole task list.
 
@@ -81,12 +111,66 @@ product pass.
 
 - The default remains visually familiar at 70% before a file is known.
 - After denoising, Shaant measures the 20th-percentile frame level as a quiet-floor proxy
-  and the 88th-percentile level as a speech proxy.
-- It estimates the wet/dry amount needed to bring residual ambience near -14 dB, caps that
-  amount if representative speech would fall below roughly -1.7 dB, and clamps the final
-  recommendation to 55–96%.
+  and the 88th-percentile energy above that floor as a speech proxy.
+- It estimates the wet/dry amount needed to bring residual ambience down while respecting
+  model-specific safety bounds. RNNoise retains its broad 55–96% range; protected DFN3 uses
+  84–94% because its native attenuation and envelope guards bound speech damage separately.
 - The recommendation is deterministic and local. Moving the slider turns Automatic off;
   turning Automatic back on restores the content-based value without re-running the model.
+- For sectional recordings, analysis is aggregated by actual decoded duration rather than
+  section count; truncated final frames and one-second tails therefore carry proportionate
+  influence.
+
+### Stronger cleanup without chopped speech
+
+- The first full real-world result selected 55% and objectively removed only 6.2 dB on
+  average from the quietest fifth of the recording. The user's report of clearly audible
+  residual noise was correct: the safety policy was too timid for this source.
+- A red regression demonstrated that comparing dry and wet loud-frame percentiles directly
+  counts removed background energy as lost speech. Voice retention now compares energy above
+  each signal's own measured floor, so successful denoising no longer penalizes Automatic.
+- DeepFilterNet3 previously used a 100 dB attenuation limit, effectively allowing an
+  unbounded mask. Its native attenuation ceiling is now 30 dB. Representative 20/30/40 dB
+  tests found 30 dB retained almost all measured floor reduction and gave the strongest local
+  speech-recognition confidence of the bounded candidates.
+- A red collapse fixture drove a new speech-envelope guard. It leaves normal model
+  attenuation and quiet frames untouched, but if a loud speech-like frame falls below about
+  one-fifth of its input envelope, aligned dry signal is restored to a conservative floor.
+  A one-frame lookahead protects consonant onsets; fast attack and slower release avoid
+  chopping and flutter.
+- With those two independent safeguards, DeepFilterNet3 Automatic now operates from 84–94%
+  instead of falling to 55%. A representative montage showed that protected 90% and raw 100%
+  both degraded transcription stability, while protected 84% stayed markedly closer to the
+  original and was selected as the balance point.
+
+### Source-specific native studio pass
+
+- The difficult full-length recording uses highly correlated stereo (0.9994 correlation;
+  side/mid RMS ratio 1.75%) and a roughly 48 kbps AAC source. A mono speech path is therefore
+  appropriate and avoids running a heavy model twice without discarding meaningful ambience.
+- Audacity-style spectral cleanup, FFmpeg `afftdn`, raw MossFormer2-SE and two-stage neural
+  mixes were evaluated on the same stratified 80-second montage. Microsoft DNSMOS P.835 was
+  used for speech/background/overall quality, while cached Whisper large-v3-turbo checked
+  word stability without conditioning on earlier text.
+- The protected browser DFN baseline scored SIG 2.502, BAK 3.256 and OVRL 2.069. Raw
+  MossFormer improved BAK to 3.349 but lowered SIG to 2.377, so it was rejected as a direct
+  replacement. Gentle `afftdn` variants also improved background scores while lowering SIG.
+- A second MossFormer pass blended 40% over protected DFN scored SIG 2.524, BAK 3.321 and
+  OVRL 2.096. Whisper kept 99.5% sequence similarity and improved average log probability
+  from -0.755 to -0.714. This was selected as the speech-safe local winner.
+- Fixed 55% produced the best DNSMOS OVRL (2.106) but transcript similarity fell to 52.9%; a
+  VAD-adaptive 40–75% experiment also changed repeated low-confidence phrases. Both were
+  rejected despite stronger background scores. The experiment confirms that maximum noise
+  removal is not the same as the best intelligible result.
+- The MLX wrapper runs MossFormer2-SE in bounded 30-second cores with two seconds of context.
+  On the M2 Max, the complete 36:02 model pass took 59.4 seconds (about 40.3× realtime) with
+  roughly 1.6 GB peak footprint. The web app remains CPU/WASM; only this optional studio pass
+  uses the Apple GPU.
+- Debugging the native path found four independent tooling faults: a removed checkpoint ID,
+  an undeclared `webrtcvad` import in `mlx-audio`, the `mlx_whisper` CLI overwriting batch
+  outputs with the first filename, and a non-frame-aligned final STFT block returning 256
+  fewer samples. The helpers now use the maintained checkpoint, a deterministic batch
+  transcriber, and exact-length fallback that preserves any sub-frame tail from the input.
 
 ### UI and experience changes
 
@@ -125,8 +209,44 @@ product pass.
   (about 18.5× realtime), selected 55% automatically, produced a 367.5 MB result, lowered
   the measured quiet opening by 5.1 dB, preserved duration exactly and copied the video
   stream bit-identically.
+- OPFS cancellation/reuse stress: an interrupted 60 s source, three rapid engine changes,
+  source replacement and four subsequent four-part runs all completed without stale mounts,
+  artifact collisions or console errors. The final section seams stayed below 2.13× their
+  local 95th-percentile sample transition, with exact A/V start and bit-identical video.
+- Forced metadata + MKV pass: browser metadata was deliberately bypassed, duration came from
+  the bounded ffmpeg probe, four sections spooled to private storage, a mid-run engine switch
+  recovered, and the result had exact duration/start timing and bit-identical video.
+- A/V offset fixtures: both audio-delayed and video-delayed inputs preserve their original
+  relative start within one AAC frame in normal and forced-sectional paths.
+- Invalid-media recovery: a video-only file reports an actionable missing-audio error, leaves
+  no stale download, and a valid replacement succeeds in the same page.
+- WebM compatibility boundary: VP8, VP9, Opus and Vorbis crash fixtures now produce a clean,
+  immediate format message with no console exception or stale output.
+- Full 36:02 OPFS rerun after the final fixes: DeepFilterNet3 completed 25 parts in 119.6 s,
+  selected 55%, produced the same 367.5 MB result, preserved duration and relative A/V start
+  exactly, and copied the video stream bit-identically.
+- Codex preview proxy: each full result is software-encoded to 960×540 H.264/AAC at about
+  194 MiB, below Codex's 256 MiB preview ceiling, while the corresponding 367.5 MB
+  original-quality master is preserved separately.
+- Quality-focused 36:02 rerun: the protected 84% policy completed 25 OPFS-backed sections in
+  121.5 s. Opening reduction improved from 5.1 to 7.5 dB. Against the earlier 55% render,
+  average reduction improved by 8.0 dB in the quietest 10% of seconds, 6.4 dB in the quietest
+  20%, and 3.8 dB across the quieter half. Duration and relative A/V start remained exact and
+  the original video stream remained bit-identical.
+- Final quality regressions: the normal DFN3 browser path reduced the synthetic floor by
+  39.4 dB; forced four-part OPFS processing reduced it by 36.4 dB with a worst local seam
+  ratio of 2.06×. Both preserved A/V start, duration and bit-identical video.
 - Desktop 1440 px and narrow 390 px visual checks: passed after fixing the mobile hero
   line-break spacing.
+- Native helper regressions: seven tests pass for clipping-safe downmix, short/long model
+  output repair, invalid wet ranges, one-frame VAD padding, quiet weighting and exact-length
+  bounded streaming output.
+- Source-specific 36:02 studio render: protected DFN plus 40% MossFormer completed with
+  103,779,328 finite samples, peak 0.672 (no clipping), exact 2162.066667 s container duration,
+  and a video packet SHA-256 identical to the protected/browser master. Its maximum and
+  99.9th-percentile sample transitions are lower than the base, so the added model cores did
+  not introduce discontinuities. A 960×540 H.264/AAC proxy is 201 MiB, below Codex's 256 MiB
+  preview ceiling; the original-quality copied-video master is 367,698,852 bytes.
 
 ## Deliberate non-changes / future candidates
 
@@ -134,6 +254,9 @@ product pass.
   existing Rust/tract DeepFilterNet path is CPU-oriented. Browser GPU dispatch plus a DSP
   reimplementation is not justified by the current model size.
 - No server model. Privacy and zero-upload behavior remain core constraints.
+- No silent WebM acceptance. The vendored core is already the latest official ffmpeg.wasm
+  core release; a predictable preflight boundary is safer than a tab-killing WASM trap. Revisit
+  support when an official core can pass the browser crash matrix.
 - Before adopting another neural model, benchmark it against DeepFilterNet3 on model bytes,
   cold start, peak memory, 48 kHz output, DNSMOS/P.835-style quality, speech attenuation and
   real browser real-time factor. A paper score alone is not enough.

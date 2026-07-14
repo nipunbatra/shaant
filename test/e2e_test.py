@@ -13,6 +13,8 @@ Run:
     URL=http://localhost:8000/ [ENGINE=rnnoise|dfn3] [NOISY=path] python3 e2e_test.py
 """
 import base64
+from array import array
+import json
 import os
 import re
 import subprocess
@@ -35,6 +37,13 @@ DOWNLOAD_VIA_BROWSER = os.environ.get("DOWNLOAD_VIA_BROWSER") == "1"
 LARGE_FILE = os.environ.get("LARGE_FILE") == "1"
 INTERRUPT_FILE = os.environ.get("INTERRUPT_FILE")
 STRESS_CYCLES = int(os.environ.get("STRESS_CYCLES", "0"))
+FORCE_DURATION_PROBE = os.environ.get("FORCE_DURATION_PROBE") == "1"
+REQUIRE_OPFS = os.environ.get("REQUIRE_OPFS") == "1"
+INVALID_FIRST = os.environ.get("INVALID_FIRST")
+MEMORY_SOURCE = os.environ.get("MEMORY_SOURCE") == "1"
+DISABLE_AV_PROBE = os.environ.get("DISABLE_AV_PROBE") == "1"
+EXPECT_REJECTION = os.environ.get("EXPECT_REJECTION") == "1"
+FINAL_STRENGTH = os.environ.get("FINAL_STRENGTH")
 
 
 def rms_db(path, seconds=None):
@@ -62,6 +71,54 @@ def has_video(path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     return bool(out)
+
+
+def av_start_offset(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,start_time", "-of", "json", path],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    starts = {}
+    for stream in json.loads(out).get("streams", []):
+        value = stream.get("start_time")
+        if value not in (None, "N/A") and stream.get("codec_type") not in starts:
+            starts[stream["codec_type"]] = float(value)
+    if "audio" not in starts or "video" not in starts:
+        return None
+    return starts["audio"] - starts["video"]
+
+
+def sectional_seam_ratios(path, part_seconds):
+    duration = media_duration(path)
+    if duration > 120:
+        return []
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "2", "-ar", "48000",
+         "-f", "f32le", "-c:a", "pcm_f32le", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    pcm = array("f")
+    pcm.frombytes(raw)
+    ratios = []
+    boundary = float(part_seconds)
+    while boundary < duration - 0.1:
+        frame = round(boundary * 48000)
+        seam = max(abs(pcm[frame * 2 + channel] - pcm[(frame - 1) * 2 + channel])
+                   for channel in range(2))
+        neighborhood = []
+        for nearby in range(max(1, frame - 480), min(len(pcm) // 2, frame + 481)):
+            if nearby == frame:
+                continue
+            neighborhood.extend(
+                abs(pcm[nearby * 2 + channel] - pcm[(nearby - 1) * 2 + channel])
+                for channel in range(2)
+            )
+        neighborhood.sort()
+        local_p95 = neighborhood[int((len(neighborhood) - 1) * 0.95)]
+        ratios.append(seam / max(1e-5, local_p95))
+        boundary += float(part_seconds)
+    return ratios
 
 
 def media_duration(path):
@@ -104,6 +161,12 @@ with sync_playwright() as p:
     if STREAMING_PART_SECONDS:
         target_url += ("&" if "?" in target_url else "?") + \
             f"stream-chunk={STREAMING_PART_SECONDS}"
+    if FORCE_DURATION_PROBE:
+        target_url += ("&" if "?" in target_url else "?") + "probe-duration=1"
+    if MEMORY_SOURCE:
+        target_url += ("&" if "?" in target_url else "?") + "memory-source=1"
+    if DISABLE_AV_PROBE:
+        target_url += ("&" if "?" in target_url else "?") + "no-av-probe=1"
     page.goto(target_url)
     page.wait_for_selector("#dropZone", timeout=10000)
     print("PAGE LOADED, badges:", page.locator(".badges").inner_text().replace("\n", " | "))
@@ -122,6 +185,38 @@ with sync_playwright() as p:
     if ENGINE == "rnnoise":
         # engine is choosable BEFORE dropping a file now
         page.check('input[name="engine"][value="rnnoise"]', force=True)
+
+    if EXPECT_REJECTION:
+        page.set_input_files("#fileInput", NOISY)
+        page.wait_for_function(
+            "() => !document.getElementById('errorBox').hidden",
+            timeout=10000,
+        )
+        error_text = page.locator("#errorBox").inner_text().lower()
+        assert "webm" in error_text, f"format rejection did not identify WebM: {error_text}"
+        assert "mp4" in error_text and "mkv" in error_text, (
+            f"format rejection did not offer useful alternatives: {error_text}"
+        )
+        assert "not been changed or uploaded" in error_text, (
+            f"format rejection did not preserve the privacy guarantee: {error_text}"
+        )
+        assert not page.locator("#downloadBtn").get_attribute("href")
+        assert not console_errors, f"rejected format caused console errors: {console_errors}"
+        print("UNSAFE FORMAT REJECTED CLEANLY; APP REMAINS RESPONSIVE")
+        browser.close()
+        sys.exit(0)
+
+    if INVALID_FIRST:
+        page.set_input_files("#fileInput", INVALID_FIRST)
+        page.wait_for_function(
+            "() => document.getElementById('videoCard').dataset.state === 'error'",
+            timeout=120000,
+        )
+        error_text = page.locator("#errorBox").inner_text().lower()
+        assert "audio" in error_text, f"invalid media error was not actionable: {error_text}"
+        assert not page.locator("#downloadBtn").get_attribute("href")
+        console_errors.clear()  # the expected processing error is already asserted above
+        print("NO-AUDIO FAILURE REPORTED; TESTING RECOVERY")
 
     # Optional adversarial setup: start another file, churn engine workers,
     # then replace the source while work is still in flight.
@@ -167,6 +262,18 @@ with sync_playwright() as p:
         info = page.locator("#resultInfo").inner_text()
         assert "RNNoise" in info, f"expected RNNoise result, got: {info}"
         print("FAST DONE:", info)
+
+    if FORCE_DURATION_PROBE:
+        assert page.locator("#videoCard").get_attribute("data-duration-source") == "ffmpeg", (
+            "forced metadata fallback did not use the bounded ffmpeg probe"
+        )
+        print("FFMPEG DURATION FALLBACK OK")
+
+    if REQUIRE_OPFS:
+        assert page.locator("#videoCard").get_attribute("data-segment-storage") == "opfs", (
+            "sectional clean audio was not spooled outside ffmpeg MEMFS"
+        )
+        print("OPFS SECTION SPOOL OK")
 
     # Sequential cycles catch stale mounts, retained sectional artifacts and
     # object-URL races that a single successful processing pass cannot expose.
@@ -250,7 +357,6 @@ with sync_playwright() as p:
 
     download_name = page.locator("#downloadBtn").get_attribute("download")
     print("DOWNLOAD NAME:", download_name)
-
     # instant A/B toggle: audio swaps via muted flags on two synced players
     assert page.evaluate("() => document.getElementById('player').muted") is True
     assert page.evaluate("() => document.getElementById('shadowPlayer').muted") is False
@@ -291,7 +397,9 @@ with sync_playwright() as p:
 
         # Synthetic fixture uses 100% for the known floor assertion. Real-world
         # fixtures return to the model's safe automatic recommendation.
-        final_strength = auto_value if REAL_WORLD else 100
+        final_strength = int(FINAL_STRENGTH) if FINAL_STRENGTH is not None else (
+            auto_value if REAL_WORLD else 100
+        )
         page.locator("#strength").evaluate(
             f"el => {{ el.value = {final_strength}; el.dispatchEvent(new Event('input')); "
             "el.dispatchEvent(new Event('change')); }"
@@ -301,6 +409,21 @@ with sync_playwright() as p:
             "() => !document.getElementById('barTrack').offsetParent || document.getElementById('barTrack').hidden",
             timeout=120000,
         )
+    elif FINAL_STRENGTH is not None:
+        final_strength = int(FINAL_STRENGTH)
+        assert 0 <= final_strength <= 100, "FINAL_STRENGTH must be between 0 and 100"
+        prior_href = page.locator("#downloadBtn").get_attribute("href")
+        page.locator("#strength").evaluate(
+            f"el => {{ el.value = {final_strength}; el.dispatchEvent(new Event('input')); "
+            "el.dispatchEvent(new Event('change')); }"
+        )
+        page.wait_for_function(
+            f"() => document.getElementById('downloadBtn').href !== '{prior_href}'"
+            " && document.getElementById('barTrack').hidden"
+            f" && document.getElementById('downloadBtn').dataset.strength === '{final_strength}'",
+            timeout=120000,
+        )
+        print("FINAL STRENGTH OVERRIDE OK:", final_strength)
 
     result_extension = os.path.splitext(download_name)[1]
     if result_extension:
@@ -346,7 +469,18 @@ print(f"A/V DURATION OK (delta {duration_delta:.3f}s)")
 if has_video(NOISY):
     assert video_md5(NOISY) == video_md5(RESULT), "video stream must be copied bit-identically"
     print("VIDEO STREAM BIT-IDENTICAL")
+    offset_before = av_start_offset(NOISY)
+    offset_after = av_start_offset(RESULT)
+    if offset_before is not None and offset_after is not None:
+        offset_delta = abs(offset_before - offset_after)
+        assert offset_delta < 0.05, f"relative A/V start changed by {offset_delta:.3f}s"
+        print(f"A/V START OFFSET OK (delta {offset_delta:.3f}s)")
 else:
     assert not has_video(RESULT), "audio-only input unexpectedly gained a video stream"
     print("AUDIO-ONLY CONTAINER PRESERVED")
+if STREAMING_PART_SECONDS:
+    seam_ratios = sectional_seam_ratios(RESULT, STREAMING_PART_SECONDS)
+    assert all(ratio < 12 for ratio in seam_ratios), f"section boundary click ratios: {seam_ratios}"
+    if seam_ratios:
+        print(f"SECTION SEAMS OK (worst local ratio {max(seam_ratios):.2f}x)")
 print("ALL CHECKS PASSED")

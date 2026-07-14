@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import {
   adaptiveResidualCleanup,
+  aggregateCleanupAnalyses,
   analyseCleanup,
+  mediaExtension,
+  parseAVStartOffset,
   parseChunkSeconds,
   planMediaSegments,
   planWorkingMemory,
+  protectSpeechEnvelope,
   reconstructSmartStereo,
   stereoProfile,
   waveformPeaks,
@@ -14,11 +18,39 @@ const SR = 48000;
 const CH = 2;
 
 {
+  const aggregate = aggregateCleanupAnalyses([
+    {
+      duration: 1, recommendedStrength: 0.55,
+      quietFloorReductionDb: 2, voiceRetentionDb: -8, quietRatio: 0.8, voiceRatio: 0.4,
+    },
+    {
+      duration: 90, recommendedStrength: 0.9,
+      quietFloorReductionDb: 24, voiceRetentionDb: -0.5, quietRatio: 0.1, voiceRatio: 0.94,
+    },
+  ]);
+  assert.equal(aggregate.recommendedStrength, 0.9,
+    "a one-second tail must not dictate strength for a 90-second section");
+}
+
+{
   assert.equal(parseChunkSeconds(null), 90,
     "a missing test override must keep the production section length");
   assert.equal(parseChunkSeconds(""), 90);
   assert.equal(parseChunkSeconds("3"), 3);
   assert.equal(parseChunkSeconds("999"), 300);
+  assert.equal(mediaExtension("CAMERA.WEBM"), "webm");
+  assert.equal(mediaExtension("recording", "video/webm; codecs=vp9"), "webm");
+  assert.equal(mediaExtension("lecture.final.MP4"), "mp4");
+  assert.equal(parseAVStartOffset([
+    "Duration: 00:00:10.00, start: 0.000000, bitrate: 895 kb/s",
+    "Stream #0:0(und): Video: h264, yuv420p, 640x360",
+    "Stream #0:1(und): Audio: aac, 22050 Hz, mono, 101 kb/s, start 0.453016 (default)",
+  ]), 0.453016);
+  assert.equal(parseAVStartOffset([
+    "Duration: 00:00:10.00, start: 2.000000, bitrate: 895 kb/s",
+    "Stream #0:0: Video: h264, start 2.250000",
+    "Stream #0:1: Audio: aac, start 2.000000",
+  ]), -0.25);
 }
 
 {
@@ -65,6 +97,23 @@ function rms(pcm, start, end) {
 }
 
 {
+  const noBudget = planWorkingMemory(1, 1, { safeLimitBytes: 0 });
+  assert(!noBudget.safe, "an explicit zero-byte budget must not fall back to the default");
+  const invalidNumbers = planWorkingMemory(Number.NaN, Number.POSITIVE_INFINITY, {
+    sampleRate: Number.NaN,
+    channels: Number.POSITIVE_INFINITY,
+    multiplier: -1,
+    safeLimitBytes: Number.NaN,
+  });
+  assert(Number.isFinite(invalidNumbers.estimatedBytes),
+    "invalid metadata must not poison the memory planner with NaN");
+  assert(Number.isFinite(invalidNumbers.secondsAtLimit),
+    "invalid metadata must still produce a bounded sectional plan");
+  assert.deepEqual(planMediaSegments(Number.NaN, 90), []);
+  assert.deepEqual(planMediaSegments(Number.POSITIVE_INFINITY, 90), []);
+}
+
+{
   const { dry, wet } = makeFixture();
   const result = analyseCleanup(dry, wet, CH);
   assert(result.quietFloorReductionDb > 17, "should measure a meaningfully lower quiet floor");
@@ -78,6 +127,40 @@ function rms(pcm, start, end) {
   const damaged = analyseCleanup(damagedFixture.dry, damagedFixture.wet, CH);
   assert(damaged.recommendedStrength < healthy.recommendedStrength, "speech damage must lower auto strength");
   assert(damaged.recommendedStrength >= 0.55, "recommendation stays inside the documented safe range");
+  const modelGuarded = analyseCleanup(damagedFixture.dry, damagedFixture.wet, CH, {
+    minimumStrength: 0.82,
+    maximumStrength: 0.94,
+  });
+  assert(modelGuarded.recommendedStrength >= 0.82 && modelGuarded.recommendedStrength <= 0.94,
+    "a model with its own attenuation and envelope guards may use a stronger Automatic range");
+}
+
+{
+  // A direct percentile comparison mistakes removed background energy for
+  // damaged speech. Here the voice component is unchanged while the strong,
+  // steady background is reduced by 20 dB.
+  const frames = 100;
+  const frameSize = 960;
+  const dry = new Float32Array(frames * frameSize * CH);
+  const wet = new Float32Array(dry.length);
+  for (let frame = 0; frame < frames; frame++) {
+    const speech = frame >= 60;
+    for (let sample = 0; sample < frameSize; sample++) {
+      const index = frame * frameSize + sample;
+      const noise = 0.25 * Math.sin(index * 0.37);
+      const cleanNoise = 0.025 * Math.sin(index * 0.37);
+      const voice = speech ? 0.14 * Math.sin(index * 0.071) : 0;
+      for (let channel = 0; channel < CH; channel++) {
+        dry[index * CH + channel] = noise + voice;
+        wet[index * CH + channel] = cleanNoise + voice;
+      }
+    }
+  }
+  const result = analyseCleanup(dry, wet, CH);
+  assert(result.voiceRetentionDb > -1,
+    "removing a loud floor must not be reported as chopped speech");
+  assert(result.recommendedStrength >= 0.8,
+    "preserved speech over a reduced floor should permit strong cleanup");
 }
 
 {
@@ -88,6 +171,45 @@ function rms(pcm, start, end) {
   assert(rms(cleaned, 0, quietEnd) < rms(wet, 0, quietEnd), "expander should lower residual quiet noise");
   assert(rms(cleaned, speechStart, cleaned.length) > rms(wet, speechStart, wet.length) * 0.9,
     "expander should retain speech-level frames");
+}
+
+{
+  const dry = new Float32Array(1920).fill(1.4);
+  const wet = new Float32Array(1920).fill(1.4);
+  dry[0] = Number.NaN;
+  wet[1] = Number.POSITIVE_INFINITY;
+  const cleaned = adaptiveResidualCleanup(dry, wet, CH);
+  assert(cleaned.every((sample) => Number.isFinite(sample) && Math.abs(sample) <= 1),
+    "residual cleanup must preserve the encoder-safe float PCM contract");
+}
+
+{
+  const frameSize = 480;
+  const frames = 100;
+  const dry = new Float32Array(frameSize * frames * CH);
+  const wet = new Float32Array(dry.length);
+  for (let frame = 0; frame < frames; frame++) {
+    const speech = frame >= 50;
+    for (let sample = 0; sample < frameSize; sample++) {
+      const index = frame * frameSize + sample;
+      const input = speech
+        ? 0.42 * Math.sin(index * 0.071)
+        : 0.05 * Math.sin(index * 0.37);
+      const model = speech ? 0 : input * 0.1;
+      for (let channel = 0; channel < CH; channel++) {
+        dry[index * CH + channel] = input;
+        wet[index * CH + channel] = model;
+      }
+    }
+  }
+  const protectedWet = protectSpeechEnvelope(dry, wet, CH);
+  const split = frameSize * 50 * CH;
+  assert(rms(protectedWet, 0, split) <= rms(wet, 0, split) * 1.1,
+    "quiet frames should retain the model's full reduction");
+  assert(rms(protectedWet, split, protectedWet.length) >= rms(dry, split, dry.length) * 0.31,
+    "a collapsed speech envelope must be restored to the safety floor");
+  assert(protectedWet.every((sample) => Number.isFinite(sample) && Math.abs(sample) <= 1),
+    "speech protection must preserve the encoder-safe PCM contract");
 }
 
 {

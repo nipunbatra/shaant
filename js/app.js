@@ -9,21 +9,29 @@ import {
 } from "./engines.js";
 import {
   adaptiveResidualCleanup,
+  aggregateCleanupAnalyses,
   analyseCleanup,
+  mediaExtension,
+  parseAVStartOffset,
   parseChunkSeconds,
   planMediaSegments,
   planWorkingMemory,
+  protectSpeechEnvelope,
   waveformPeaks,
 } from "./audio-utils.mjs";
 
 const SR = 48000;
 const CH = 2;
 const MAX_FILE_BYTES = 1.5 * 1024 * 1024 * 1024;
+const MAX_UNPROBED_FILE_BYTES = 128 * 1024 * 1024;
 const PCM_WORKING_SET_MULTIPLIER = 4.25;
 const STREAM_PRIME_SECONDS = 1;
 const QUERY = new URLSearchParams(location.search);
 const STREAM_CHUNK_SECONDS = parseChunkSeconds(QUERY.get("stream-chunk"));
 const FORCE_SEGMENTED = QUERY.has("streaming");
+const FORCE_DURATION_PROBE = QUERY.has("probe-duration");
+const FORCE_MEMORY_SOURCE = QUERY.has("memory-source");
+const DISABLE_AV_PROBE = QUERY.has("no-av-probe");
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -58,7 +66,10 @@ let ffProgressSpan = 0;
 let logTail = [];
 let detectedVideo = false;
 const SOURCE_MOUNT_POINT = "/source";
+const CLEAN_MOUNT_POINT = "/clean-sections";
 let sourceMounted = false;
+let cleanPartsMounted = false;
+let sectionSpool = null;
 
 let currentFile = null;
 let inputFsName = null;
@@ -85,6 +96,7 @@ let previewToken = 0;
 let busy = false;
 let runSeq = 0;
 let denoiseRun = null;
+let sourceAVStartOffset = null;
 
 const PLAY_ICON = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M2 1l9 5-9 5z"/></svg>';
 const PAUSE_ICON = '<svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><rect x="2" y="1" width="3" height="10"/><rect x="7" y="1" width="3" height="10"/></svg>';
@@ -236,6 +248,17 @@ function selectedEngineId() {
   return document.querySelector('input[name="engine"]:checked').value;
 }
 
+function cleanupAnalysisOptions(engineId) {
+  return engineId === "dfn3"
+    ? {
+        minimumStrength: 0.84,
+        baselineStrength: 0.86,
+        maximumStrength: 0.94,
+        targetQuietRatio: 0.16,
+      }
+    : {};
+}
+
 function updateEngineBadge() {
   els.engineBadge.textContent = ENGINE_INFO[selectedEngineId()].short;
 }
@@ -298,6 +321,13 @@ function setFile(file) {
     showStandaloneError(`This file is ${fmtSize(file.size)}. Browser-based processing currently supports source files up to 1.5 GB.`);
     return;
   }
+  if (mediaExtension(file.name, file.type) === "webm") {
+    showStandaloneError(
+      "WebM is temporarily unavailable because the browser audio engine can crash while decoding it. " +
+      "Convert the file to MP4, MOV or MKV first, then try again. Your file has not been changed or uploaded.",
+    );
+    return;
+  }
 
   cancelActiveDenoise();
   runSeq++;
@@ -316,6 +346,9 @@ function setFile(file) {
   processedReady = false;
   originalPlaybackFailed = false;
   previewToken++;
+  sourceAVStartOffset = null;
+  delete els.videoCard.dataset.durationSource;
+  delete els.videoCard.dataset.segmentStorage;
 
   els.dropZone.classList.add("compact");
   els.dropTitle.hidden = true;
@@ -375,7 +408,7 @@ function ensureFFmpeg() {
     ffmpeg = new FFmpeg();
     ffmpeg.on("log", ({ message }) => {
       logTail.push(message);
-      if (logTail.length > 60) logTail.shift();
+      if (logTail.length > 120) logTail.shift();
       if (/Stream #0:\d+.*: Video:/.test(message) && !/attached pic/.test(message)) detectedVideo = true;
     });
     ffmpeg.on("progress", ({ progress }) => {
@@ -415,10 +448,13 @@ async function processCurrent() {
   applyAB();
 
   try {
-    const sourceDuration = await waitForSourceMetadata(seq);
+    let sourceDuration = FORCE_DURATION_PROBE ? null : await waitForSourceMetadata(seq);
     if (seq !== runSeq) return;
-    const memoryPlan = sourceDuration ? getWorkingMemoryPlan(file, sourceDuration) : null;
-    const useSegmentedPipeline = FORCE_SEGMENTED || (memoryPlan && !memoryPlan.safe);
+    if (sourceDuration) els.videoCard.dataset.durationSource = "browser";
+    const initialMemoryPlan = sourceDuration ? getWorkingMemoryPlan(file, sourceDuration) : null;
+    const allowMemoryStaging = initialMemoryPlan
+      ? initialMemoryPlan.safe
+      : file.size <= MAX_UNPROBED_FILE_BYTES;
 
     setStatus("Loading local tools…", true, false, 0.02);
     await Promise.all([
@@ -430,13 +466,45 @@ async function processCurrent() {
     const runInputName = await withFF(async () => {
       if (seq !== runSeq) return null;
       await cleanupSegmentedArtifactsLocked();
-      return stageSourceFileLocked(file, seq);
+      return stageSourceFileLocked(file, seq, allowMemoryStaging);
     });
     if (seq !== runSeq || !runInputName) return;
+
+    const probedAVStartOffset = isAudioFile(file) || DISABLE_AV_PROBE
+      ? 0
+      : await probeAVStartOffset(file, seq);
+    if (seq !== runSeq) return;
+
+    let probedHasVideo = false;
+    if (!sourceDuration) {
+      setStatus("Reading recording duration safely…", true, false, 0.04);
+      const metadata = await withFF(() => probeSourceMetadataLocked(runInputName, seq));
+      sourceDuration = metadata?.duration || null;
+      probedHasVideo = Boolean(metadata?.hasVideo);
+      if (seq !== runSeq) return;
+      if (sourceDuration) {
+        els.videoCard.dataset.durationSource = "ffmpeg";
+        els.fileMeta.textContent = `${fmtSize(file.size)} · ${fmtTime(sourceDuration)} · click to replace`;
+        console.debug(`[denoise] duration=ffmpeg seconds=${sourceDuration.toFixed(3)}`);
+      }
+    }
+
+    if (!sourceDuration && file.size > MAX_UNPROBED_FILE_BYTES) {
+      const error = new Error(
+        "Shaant could not determine this large recording's duration safely. " +
+        "Try remuxing it to MP4, MOV, MKV or WebM without re-encoding.",
+      );
+      error.userFacing = true;
+      throw error;
+    }
+
+    const memoryPlan = sourceDuration ? getWorkingMemoryPlan(file, sourceDuration) : null;
+    const useSegmentedPipeline = FORCE_SEGMENTED || Boolean(memoryPlan && !memoryPlan.safe);
 
     if (useSegmentedPipeline && sourceDuration) {
       await processSegmentedFile({
         seq, file, runInputName, sourceDuration, engineId, engine, smartStereo, started,
+        knownHasVideo: probedHasVideo, knownAVStartOffset: probedAVStartOffset,
       });
       return;
     }
@@ -466,7 +534,16 @@ async function processCurrent() {
       }
       const data = await ffmpeg.readFile(rawName);
       await ffmpeg.deleteFile(rawName);
-      return { data, hasVideo: detectedVideo };
+      const loggedOffset = parseAVStartOffset(logTail);
+      const avStartOffset = Math.abs(probedAVStartOffset) >= 0.0005
+        ? probedAVStartOffset
+        : loggedOffset;
+      console.debug(`[denoise] av-offset=${avStartOffset.toFixed(6)}`);
+      return {
+        data,
+        hasVideo: detectedVideo || probedHasVideo,
+        avStartOffset,
+      };
     });
     if (seq !== runSeq || !extracted) return;
 
@@ -500,9 +577,12 @@ async function processCurrent() {
     if (seq !== runSeq) return;
 
     const delay = denoised.aligned ? 0 : measureDelay(dryPcm, denoised.wet, CH);
-    modelPcm = denoised.aligned ? denoised.wet : compensateDelay(denoised.wet, CH, delay);
+    const alignedModel = denoised.aligned
+      ? denoised.wet
+      : compensateDelay(denoised.wet, CH, delay);
+    modelPcm = protectSpeechEnvelope(dryPcm, alignedModel, CH);
     rebuildWetPcm();
-    cleanupAnalysis = analyseCleanup(dryPcm, modelPcm, CH);
+    cleanupAnalysis = analyseCleanup(dryPcm, modelPcm, CH, cleanupAnalysisOptions(engineId));
     recommendedStrength = cleanupAnalysis.recommendedStrength;
     if (els.autoStrength.checked) applyRecommendedStrength();
     else updateStrengthUI();
@@ -516,6 +596,7 @@ async function processCurrent() {
       engine,
       workers: denoised.workers,
       mode: denoised.mode,
+      avStartOffset: extracted.avStartOffset,
     };
     lastExportContext = context;
 
@@ -543,7 +624,12 @@ async function processCurrent() {
     els.qualityStrip.hidden = false;
     els.videoCard.dataset.state = "ready";
     setStatus("Ready to compare", false, true, 1);
-    console.debug(`[denoise] engine=${engineId} workers=${denoised.workers} mode=${denoised.mode} delay=${delay} samples auto=${Math.round(recommendedStrength * 100)}% total=${secondsLabel}s`);
+    console.debug(
+      `[denoise] engine=${engineId} workers=${denoised.workers} mode=${denoised.mode} ` +
+      `delay=${delay} samples auto=${Math.round(recommendedStrength * 100)}% ` +
+      `quiet-ratio=${cleanupAnalysis.quietRatio.toFixed(3)} ` +
+      `voice-ratio=${cleanupAnalysis.voiceRatio.toFixed(3)} total=${secondsLabel}s`,
+    );
   } catch (error) {
     if (seq === runSeq) showError(error);
   } finally {
@@ -584,11 +670,134 @@ function getWorkingMemoryPlan(file, duration) {
   });
 }
 
+async function probeSourceMetadataLocked(inputName, seq) {
+  try {
+    detectedVideo = false;
+    logTail = [];
+    const returnCode = await ffmpeg.exec([
+      "-hide_banner", "-i", inputName,
+      "-map", "0:a:0", "-t", "0.001", "-f", "null", "-",
+    ]);
+    if (returnCode !== 0 || seq !== runSeq) return null;
+    const durationLine = logTail.find((line) => line.includes("Duration:"));
+    const match = durationLine?.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (!match) return null;
+    const duration = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+    return Number.isFinite(duration) && duration > 0
+      ? { duration, hasVideo: detectedVideo }
+      : null;
+  } catch (error) {
+    console.warn("[denoise] duration-probe failed", error);
+    return null;
+  }
+}
+
+async function probeAVStartOffset(file, seq) {
+  if (sourceAVStartOffset !== null) return sourceAVStartOffset;
+  const probe = new FFmpeg();
+  const logs = [];
+  try {
+    probe.on("log", ({ message }) => {
+      logs.push(message);
+      if (logs.length > 120) logs.shift();
+    });
+    const base = new URL(".", document.baseURI).href;
+    await probe.load({
+      coreURL: base + "vendor/ffmpeg-core/ffmpeg-core.js",
+      wasmURL: base + "vendor/ffmpeg-core/ffmpeg-core.wasm",
+    });
+    await probe.createDir(SOURCE_MOUNT_POINT);
+    const mounted = await probe.mount(
+      FFFSType.WORKERFS,
+      { files: [file] },
+      SOURCE_MOUNT_POINT,
+    );
+    if (!mounted) return 0;
+    const inputName = `${SOURCE_MOUNT_POINT}/${file.name}`;
+    const returnCode = await probe.exec([
+      "-copyts", "-i", inputName,
+      "-filter_complex", "[0:a:0]ashowinfo[a];[0:v:0]showinfo[v]",
+      "-map", "[a]", "-map", "[v]",
+      "-frames:a", "1", "-frames:v", "1",
+      "-f", "null", "-",
+    ]);
+    if (returnCode !== 0 || seq !== runSeq) return 0;
+    const first = (filterName) => {
+      const line = logs.find((entry) =>
+        entry.includes(`[Parsed_${filterName}_`) && /\bn:\s*0\b/.test(entry) && entry.includes("pts_time:"));
+      const value = Number(line?.match(/pts_time:\s*(-?\d+(?:\.\d+)?)/)?.[1]);
+      return Number.isFinite(value) ? value : null;
+    };
+    const audioStart = first("ashowinfo");
+    const videoStart = first("showinfo");
+    const offset = audioStart === null || videoStart === null ? 0 : audioStart - videoStart;
+    if (seq === runSeq) sourceAVStartOffset = offset;
+    return offset;
+  } catch (error) {
+    console.warn("[denoise] A/V timestamp probe failed; using normalized starts.", error);
+    return 0;
+  } finally {
+    probe.terminate();
+  }
+}
+
 async function cleanupSegmentedArtifactsLocked() {
+  if (cleanPartsMounted) {
+    try { await ffmpeg.unmount(CLEAN_MOUNT_POINT); } catch {}
+    cleanPartsMounted = false;
+  }
   for (const name of segmentedArtifacts) {
     try { await ffmpeg.deleteFile(name); } catch {}
   }
   segmentedArtifacts = [];
+  await cleanupSectionSpool();
+}
+
+async function cleanupSectionSpool() {
+  const spool = sectionSpool;
+  sectionSpool = null;
+  await removeSectionSpool(spool);
+}
+
+async function removeSectionSpool(spool) {
+  if (!spool) return;
+  try { await spool.parent.removeEntry(spool.name, { recursive: true }); } catch {}
+}
+
+async function createSectionSpool(seq) {
+  if (!navigator.storage?.getDirectory) return null;
+  try {
+    const root = await navigator.storage.getDirectory();
+    const parent = await root.getDirectoryHandle("shaant-temporary-audio", { create: true });
+    // A tab can be closed before asynchronous cleanup runs. Reclaim old runs,
+    // but never delete a directory that another active tab may still own.
+    for await (const [name] of parent.entries()) {
+      const timestamp = Number(name.split("-").at(-1));
+      if (name.startsWith("run-") && Number.isFinite(timestamp) &&
+          Date.now() - timestamp > 24 * 60 * 60 * 1000) {
+        try { await parent.removeEntry(name, { recursive: true }); } catch {}
+      }
+    }
+    const name = `run-${seq}-${Date.now()}`;
+    const directory = await parent.getDirectoryHandle(name, { create: true });
+    return { parent, directory, name, files: [] };
+  } catch (error) {
+    console.warn("[denoise] OPFS section spool unavailable; using memory.", error);
+    return null;
+  }
+}
+
+async function spoolCleanPart(spool, name, data) {
+  const handle = await spool.directory.getFileHandle(name, { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(data);
+  } finally {
+    await writable.close();
+  }
+  const file = await handle.getFile();
+  spool.files.push(file);
+  return `${CLEAN_MOUNT_POINT}/${name}`;
 }
 
 async function cleanupSourceFileLocked() {
@@ -601,7 +810,7 @@ async function cleanupSourceFileLocked() {
   inputFsName = null;
 }
 
-async function stageSourceFileLocked(file, seq) {
+async function stageSourceFileLocked(file, seq, allowMemoryFallback = true) {
   await cleanupSourceFileLocked();
   try { await ffmpeg.createDir(SOURCE_MOUNT_POINT); } catch {}
 
@@ -609,6 +818,7 @@ async function stageSourceFileLocked(file, seq) {
   // it does not duplicate the complete compressed video inside the WASM heap;
   // ffmpeg reads only the byte ranges requested by the demuxer.
   try {
+    if (FORCE_MEMORY_SOURCE) throw new Error("in-memory source forced for diagnostics");
     const mounted = await ffmpeg.mount(
       FFFSType.WORKERFS,
       { files: [file] },
@@ -622,10 +832,20 @@ async function stageSourceFileLocked(file, seq) {
   } catch (error) {
     try { await ffmpeg.unmount(SOURCE_MOUNT_POINT); } catch {}
     sourceMounted = false;
-    console.warn("[denoise] Direct file mount unavailable; using in-memory staging.", error);
+    console.warn("[denoise] Direct file mount unavailable.", error);
+  }
+
+  if (!allowMemoryFallback) {
+    const error = new Error(
+      "This browser could not open the recording through the memory-safe file mount. " +
+      "Try the latest Chrome, Edge or Firefox instead of loading the whole file into memory.",
+    );
+    error.userFacing = true;
+    throw error;
   }
 
   const extension = (file.name.split(".").pop() || "dat").toLowerCase();
+  console.debug("[denoise] source=in-memory-fallback");
   const safeExtension = /^[a-z0-9]{1,5}$/.test(extension) ? extension : "dat";
   const fallbackName = `input-${seq}.${safeExtension}`;
   const bytes = new Uint8Array(await file.arrayBuffer());
@@ -636,16 +856,27 @@ async function stageSourceFileLocked(file, seq) {
 
 async function processSegmentedFile({
   seq, file, runInputName, sourceDuration, engineId, engine, smartStereo, started,
+  knownHasVideo = false, knownAVStartOffset = 0,
 }) {
   const segments = planMediaSegments(sourceDuration, STREAM_CHUNK_SECONDS);
   const partCount = segments.length;
   const analyses = [];
   const partNames = [];
   let usedWorkers = 1;
-  let detectedInputVideo = false;
+  let detectedInputVideo = knownHasVideo;
+  let avStartOffset = knownAVStartOffset;
   streamedWaveform = { dry: [], wet: [] };
   dryPcm = modelPcm = wetPcm = null;
   waveformCache = {};
+
+  const spool = await createSectionSpool(seq);
+  if (seq !== runSeq) {
+    await removeSectionSpool(spool);
+    return;
+  }
+  sectionSpool = spool;
+  let segmentStorageMode = spool ? "opfs" : "memfs";
+  els.videoCard.dataset.segmentStorage = segmentStorageMode;
 
   setStatus(`Preparing ${partCount} memory-safe parts…`, true, false, 0.04);
 
@@ -687,11 +918,19 @@ async function processSegmentedFile({
       }
       const data = await ffmpeg.readFile(rawName);
       await ffmpeg.deleteFile(rawName);
-      if (part === 0) detectedInputVideo = detectedVideo;
+      if (part === 0) {
+        detectedInputVideo = detectedInputVideo || detectedVideo;
+        const loggedOffset = parseAVStartOffset(logTail);
+        if (Math.abs(avStartOffset) < 0.0005) avStartOffset = loggedOffset;
+      }
       return data;
     });
     if (!raw || seq !== runSeq) return;
     console.debug(`[denoise] part=${part + 1}/${partCount} stage=model bytes=${raw.byteLength}`);
+    if (raw.byteLength < CH * Float32Array.BYTES_PER_ELEMENT) {
+      console.debug(`[denoise] part=${part + 1}/${partCount} stage=empty-skip`);
+      continue;
+    }
 
     let dryFull;
     if (raw.byteOffset % 4 === 0 && raw.byteLength % 4 === 0) {
@@ -723,7 +962,10 @@ async function processSegmentedFile({
     usedWorkers = Math.max(usedWorkers, denoised.workers);
 
     const delay = denoised.aligned ? 0 : measureDelay(dryFull, denoised.wet, CH);
-    const modelFull = denoised.aligned ? denoised.wet : compensateDelay(denoised.wet, CH, delay);
+    const alignedModel = denoised.aligned
+      ? denoised.wet
+      : compensateDelay(denoised.wet, CH, delay);
+    const modelFull = protectSpeechEnvelope(dryFull, alignedModel, CH);
     const enhancedFull = els.adaptiveCleanup.checked
       ? adaptiveResidualCleanup(dryFull, modelFull, CH)
       : modelFull;
@@ -736,9 +978,11 @@ async function processSegmentedFile({
     const modelKeep = modelFull.subarray(startSample, endSample);
     const enhancedKeep = enhancedFull.subarray(startSample, endSample);
 
-    const analysis = analyseCleanup(dryKeep, modelKeep, CH);
-    analyses.push({ ...analysis, duration: keepDuration });
-    const peakCount = Math.max(24, Math.round(keepDuration * 0.7));
+    if (!keepFrames) continue;
+    const actualKeepDuration = keepFrames / SR;
+    const analysis = analyseCleanup(dryKeep, modelKeep, CH, cleanupAnalysisOptions(engineId));
+    analyses.push({ ...analysis, duration: actualKeepDuration });
+    const peakCount = Math.max(24, Math.round(actualKeepDuration * 0.7));
     streamedWaveform.dry.push(...waveformPeaks(dryKeep, CH, peakCount));
     streamedWaveform.wet.push(...waveformPeaks(enhancedKeep, CH, peakCount));
     waveformCache = {};
@@ -773,12 +1017,72 @@ async function processSegmentedFile({
       if (seq === runSeq) throw new Error(`Could not store cleaned audio part ${part + 1}.`);
       return;
     }
-    partNames.push(flacName);
-    segmentedArtifacts.push(flacName);
+    let storedName = flacName;
+    if (spool) {
+      try {
+        const flacData = await withFF(() => ffmpeg.readFile(flacName));
+        if (seq !== runSeq) {
+          await withFF(async () => { try { await ffmpeg.deleteFile(flacName); } catch {} });
+          await removeSectionSpool(spool);
+          return;
+        }
+        storedName = await spoolCleanPart(spool, flacName, flacData);
+        if (seq !== runSeq) {
+          await withFF(async () => { try { await ffmpeg.deleteFile(flacName); } catch {} });
+          await removeSectionSpool(spool);
+          return;
+        }
+        await withFF(async () => {
+          try { await ffmpeg.deleteFile(flacName); } catch {}
+        });
+      } catch (error) {
+        if (seq !== runSeq) {
+          await withFF(async () => { try { await ffmpeg.deleteFile(flacName); } catch {} });
+          await removeSectionSpool(spool);
+          return;
+        }
+        segmentStorageMode = "hybrid";
+        els.videoCard.dataset.segmentStorage = segmentStorageMode;
+        console.warn(`[denoise] Could not spool part ${part + 1}; keeping it in memory.`, error);
+      }
+    }
+    partNames.push(storedName);
+    if (storedName === flacName) segmentedArtifacts.push(flacName);
     console.debug(`[denoise] part=${part + 1}/${partCount} stage=done`);
   }
 
   if (seq !== runSeq) return;
+  if (!partNames.length) throw new Error("The selected recording contains no decodable audio samples.");
+  if (spool?.files.length) {
+    await withFF(async () => {
+      if (seq !== runSeq || sectionSpool !== spool) return;
+      try { await ffmpeg.createDir(CLEAN_MOUNT_POINT); } catch {}
+      const mounted = await ffmpeg.mount(
+        FFFSType.WORKERFS,
+        { files: spool.files },
+        CLEAN_MOUNT_POINT,
+      );
+      if (mounted) {
+        cleanPartsMounted = true;
+        return;
+      }
+
+      // Very old WORKERFS builds may reject a second mount. Restore only the
+      // already-spooled compressed parts to MEMFS as a compatibility fallback.
+      segmentStorageMode = "memfs-fallback";
+      els.videoCard.dataset.segmentStorage = segmentStorageMode;
+      for (const file of spool.files) {
+        await ffmpeg.writeFile(file.name, new Uint8Array(await file.arrayBuffer()));
+        segmentedArtifacts.push(file.name);
+      }
+      for (let index = 0; index < partNames.length; index++) {
+        if (partNames[index].startsWith(`${CLEAN_MOUNT_POINT}/`)) {
+          partNames[index] = partNames[index].slice(CLEAN_MOUNT_POINT.length + 1);
+        }
+      }
+    });
+    if (seq !== runSeq || sectionSpool !== spool) return;
+  }
   const listName = `clean-${seq}-parts.txt`;
   const listText = partNames.map((name) => `file '${name}'`).join("\n") + "\n";
   await withFF(async () => {
@@ -787,7 +1091,7 @@ async function processSegmentedFile({
   });
   segmentedArtifacts.push(listName);
 
-  cleanupAnalysis = aggregateSegmentAnalyses(analyses);
+  cleanupAnalysis = aggregateCleanupAnalyses(analyses);
   recommendedStrength = cleanupAnalysis.recommendedStrength;
   if (els.autoStrength.checked) applyRecommendedStrength();
   else updateStrengthUI();
@@ -804,6 +1108,7 @@ async function processSegmentedFile({
     mode: `streamed · ${partCount} parts`,
     segmented: true,
     cleanList: listName,
+    avStartOffset,
   };
   lastExportContext = context;
   setStatus(detectedInputVideo ? "Rebuilding the full video…" : "Building the full audio file…",
@@ -824,24 +1129,12 @@ async function processSegmentedFile({
   els.qualityStrip.hidden = false;
   els.videoCard.dataset.state = "ready";
   setStatus("Ready to compare", false, true, 1);
-  console.debug(`[denoise] engine=${engineId} workers=${usedWorkers} mode=streamed parts=${partCount} auto=${Math.round(recommendedStrength * 100)}% total=${secondsLabel}s`);
-}
-
-function aggregateSegmentAnalyses(analyses) {
-  if (!analyses.length) return analyseCleanup(null, null, CH);
-  const byRecommendation = analyses.map((item) => item.recommendedStrength).sort((a, b) => a - b);
-  const conservativeIndex = Math.floor((byRecommendation.length - 1) * 0.25);
-  const weighted = (key) => {
-    const total = analyses.reduce((sum, item) => sum + item.duration, 0);
-    return analyses.reduce((sum, item) => sum + item[key] * item.duration, 0) / Math.max(0.001, total);
-  };
-  return {
-    recommendedStrength: byRecommendation[conservativeIndex],
-    quietFloorReductionDb: weighted("quietFloorReductionDb"),
-    voiceRetentionDb: weighted("voiceRetentionDb"),
-    quietRatio: weighted("quietRatio"),
-    voiceRatio: weighted("voiceRatio"),
-  };
+  console.debug(
+    `[denoise] engine=${engineId} workers=${usedWorkers} mode=streamed parts=${partCount} ` +
+    `auto=${Math.round(recommendedStrength * 100)}% ` +
+    `quiet-ratio=${cleanupAnalysis.quietRatio.toFixed(3)} ` +
+    `voice-ratio=${cleanupAnalysis.voiceRatio.toFixed(3)} total=${secondsLabel}s`,
+  );
 }
 
 function rebuildWetPcm() {
@@ -893,8 +1186,13 @@ async function exportWithStrength(strength, context) {
   const payload = await withFF(async () => {
     if (context.seq !== runSeq) return null;
     await ffmpeg.writeFile("denoised.f32", transferable);
-    const inputExtension = context.inputName.split(".").pop();
-    const rawArgs = ["-f", "f32le", "-ar", String(SR), "-ac", String(CH), "-i", "denoised.f32"];
+    const timingArgs = Math.abs(context.avStartOffset || 0) >= 0.0005
+      ? ["-itsoffset", Number(context.avStartOffset).toFixed(6)]
+      : [];
+    const rawArgs = [
+      ...timingArgs,
+      "-f", "f32le", "-ar", String(SR), "-ac", String(CH), "-i", "denoised.f32",
+    ];
     const attempts = [];
     if (!context.hasVideo) {
       attempts.push({
@@ -903,9 +1201,6 @@ async function exportWithStrength(strength, context) {
       });
     } else {
       const copyVideo = ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"];
-      if (inputExtension === "webm") {
-        attempts.push({ ext: "webm", mime: "video/webm", args: [...copyVideo, "-c:a", "libopus", "-b:a", "128k"] });
-      }
       attempts.push({
         ext: "mp4", mime: "video/mp4",
         args: [...copyVideo, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"],
@@ -948,15 +1243,16 @@ async function exportSegmentedWithStrength(strength, context) {
   const revision = wetRevision;
   const dryWeight = Math.max(0, 1 - strength).toFixed(6);
   const wetWeight = Math.min(1, Math.max(0, strength)).toFixed(6);
+  const startOffset = Number(context.avStartOffset) || 0;
   const filter =
-    `[0:a:0]aresample=${SR}:first_pts=0[dry];` +
-    `[1:a:0]aresample=${SR}:first_pts=0[wet];` +
+    `[0:a:0]aresample=${SR},asetpts=PTS-STARTPTS[dry];` +
+    `[1:a:0]aresample=${SR},asetpts=PTS-STARTPTS[wet];` +
     `[dry][wet]amix=inputs=2:weights='${dryWeight} ${wetWeight}':` +
-    `normalize=0:duration=first[outa]`;
+    `normalize=0:duration=first[mixed];` +
+    `[mixed]asetpts=PTS+${startOffset.toFixed(6)}/TB[outa]`;
 
   const payload = await withFF(async () => {
     if (context.seq !== runSeq) return null;
-    const inputExtension = context.inputName.split(".").pop();
     const commonInput = [
       "-i", context.inputName,
       "-f", "concat", "-safe", "0", "-i", context.cleanList,
@@ -970,9 +1266,6 @@ async function exportSegmentedWithStrength(strength, context) {
       });
     } else {
       const copyVideo = ["-map", "0:v:0", "-map", "[outa]", "-c:v", "copy"];
-      if (inputExtension === "webm") {
-        attempts.push({ ext: "webm", mime: "video/webm", args: [...copyVideo, "-c:a", "libopus", "-b:a", "128k"] });
-      }
       attempts.push({
         ext: "mp4", mime: "video/mp4",
         args: [...copyVideo, "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"],
