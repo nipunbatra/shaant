@@ -1,92 +1,130 @@
 // Parallel denoise orchestration. PCM is interleaved Float32 in [-1, 1] at 48 kHz.
 //
-// The audio is split per channel into ~6 s chunks and fanned out to a pool of
-// Web Workers (one wasm engine instance per worker). Each chunk is prefixed
-// with 1 s of "priming" audio so the recurrent model's state adapts before the
-// kept region starts, and consecutive kept regions are stitched with a 20 ms
-// crossfade. Pools are cached, so re-runs skip engine startup.
+// Audio is split into chunks with a state-priming lead-in, processed across a
+// lazily-sized worker pool, and stitched with a short crossfade. For ordinary
+// centred stereo recordings, Smart Stereo processes the coherent mid channel
+// once and applies the learned attenuation to the side channel. That prevents
+// left/right model drift and roughly halves neural inference work.
 
-const CHUNK = 288000;  // 6 s kept region per task
-const PRIME = 48000;   // 1 s state warm-up, discarded
-const XFADE = 960;     // 20 ms crossfade at chunk seams
+import { reconstructSmartStereo, stereoProfile } from "./audio-utils.mjs";
+
+const CHUNK = 384000; // 8 s kept region per task
+const PRIME = 48000;  // 1 s state warm-up, discarded
+const XFADE = 960;    // 20 ms crossfade at chunk seams
 
 export const ENGINE_INFO = {
-  rnnoise: { label: "RNNoise · WASM SIMD (CPU)", short: "RNNoise", maxWorkers: 8 },
-  dfn3: { label: "DeepFilterNet3 · WASM SIMD (CPU)", short: "DeepFilterNet3", maxWorkers: 6 },
+  rnnoise: { label: "RNNoise · WASM SIMD", short: "RNNoise", maxWorkers: 8 },
+  dfn3: { label: "DeepFilterNet3 · WASM SIMD", short: "DeepFilterNet3", maxWorkers: 6 },
 };
 
 const MODEL_URL = new URL("../vendor/deepfilternet/DeepFilterNet3_onnx.tar.gz", import.meta.url).href;
+let modelPromise = null;
+
+async function getDeepFilterModel() {
+  if (!modelPromise) {
+    modelPromise = (async () => {
+      const response = await fetch(MODEL_URL);
+      if (!response.ok) throw new Error(`DeepFilterNet model download failed (${response.status})`);
+      return new Uint8Array(await response.arrayBuffer());
+    })();
+    modelPromise.catch(() => { modelPromise = null; });
+  }
+  return modelPromise;
+}
 
 class WorkerPool {
-  constructor(engineId, size) {
+  constructor(engineId, maxSize) {
     this.engineId = engineId;
-    this.size = size;
+    this.maxSize = maxSize;
     this.workers = [];
+    this._growPromise = Promise.resolve();
+    this._activeReject = null;
+    this._initRejects = new Set();
+    this.disposed = false;
   }
 
-  async init() {
-    // fetch the DFN3 model once and copy bytes to each worker — otherwise N
-    // cold-cache workers each download the 8 MB tar.gz in parallel
-    let model = null;
-    if (this.engineId === "dfn3") {
-      const resp = await fetch(MODEL_URL);
-      if (!resp.ok) throw new Error("model fetch failed: " + resp.status);
-      model = new Uint8Array(await resp.arrayBuffer());
-    }
-    const spawn = () => {
-      const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-      this.workers.push(w);
-      return new Promise((resolve, reject) => {
-        w.onmessage = (e) => {
-          if (e.data.type === "ready") resolve();
-          else if (e.data.type === "error") reject(new Error(e.data.message));
+  get size() { return this.workers.length; }
+
+  async spawn() {
+    if (this.disposed) throw new Error("worker pool was disposed");
+    const model = this.engineId === "dfn3" ? await getDeepFilterModel() : null;
+    if (this.disposed) throw new Error("worker pool was disposed");
+    const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    this.workers.push(worker);
+    let rejectInit = null;
+    try {
+      await new Promise((resolve, reject) => {
+        rejectInit = reject;
+        this._initRejects.add(reject);
+        worker.onmessage = (event) => {
+          if (event.data.type === "ready") resolve();
+          else if (event.data.type === "error") reject(new Error(event.data.message));
         };
-        w.onerror = (e) => reject(new Error("worker failed to start: " + e.message));
-        w.postMessage({ type: "init", engine: this.engineId, model });
+        worker.onerror = (event) => reject(new Error("worker failed to start: " + event.message));
+        worker.postMessage({ type: "init", engine: this.engineId, model });
       });
-    };
-    // first worker alone, so its module/wasm downloads land in the HTTP cache
-    // before the rest spawn; then the remainder start in parallel
-    await spawn();
-    await Promise.all(Array.from({ length: this.size - 1 }, spawn));
+    } catch (error) {
+      worker.terminate();
+      this.workers = this.workers.filter((candidate) => candidate !== worker);
+      throw error;
+    } finally {
+      if (rejectInit) this._initRejects.delete(rejectInit);
+    }
+  }
+
+  async ensureSize(requested) {
+    const target = Math.max(1, Math.min(this.maxSize, requested));
+    this._growPromise = this._growPromise.then(async () => {
+      if (this.disposed) throw new Error("worker pool was disposed");
+      if (this.workers.length === 0) await this.spawn();
+      const missing = Math.max(0, target - this.workers.length);
+      if (missing) await Promise.all(Array.from({ length: missing }, () => this.spawn()));
+    });
+    return this._growPromise;
   }
 
   // tasks: [{ id, data: Float32Array }] — data buffers are transferred.
-  // onTaskProgress(id, doneSamples), resolves to Map(id -> Float32Array)
+  // onTaskProgress(id, doneSamples), resolves to Map(id -> Float32Array).
   run(tasks, onTaskProgress) {
+    if (!tasks.length) return Promise.resolve(new Map());
     return new Promise((resolve, reject) => {
-      this._activeReject = reject;
       const results = new Map();
       const queue = tasks.slice();
       let failed = false;
 
-      const feed = (w) => {
-        const t = queue.shift();
-        if (!t) return;
-        w.__task = t.id;
-        w.postMessage({ type: "task", id: t.id, data: t.data }, [t.data.buffer]);
+      const fail = (error) => {
+        if (failed) return;
+        failed = true;
+        this._activeReject = null;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
+      this._activeReject = (error) => fail(error);
+
+      const feed = (worker) => {
+        const task = queue.shift();
+        if (!task || failed) return;
+        worker.__task = task.id;
+        worker.postMessage({ type: "task", id: task.id, data: task.data }, [task.data.buffer]);
       };
 
-      for (const w of this.workers) {
-        w.onerror = (e) => {
-          failed = true;
-          reject(new Error("worker crashed: " + e.message));
-        };
-        w.onmessage = (e) => {
+      for (const worker of this.workers) {
+        worker.onerror = (event) => fail(new Error("worker crashed: " + event.message));
+        worker.onmessage = (event) => {
           if (failed) return;
-          const m = e.data;
-          if (m.type === "progress") {
-            onTaskProgress?.(m.id, m.done);
-          } else if (m.type === "result") {
-            results.set(m.id, m.out);
-            onTaskProgress?.(m.id, m.out.length);
+          const message = event.data;
+          if (message.type === "progress") {
+            onTaskProgress?.(message.id, message.done);
+          } else if (message.type === "result") {
+            results.set(message.id, message.out);
+            onTaskProgress?.(message.id, message.out.length);
             if (results.size === tasks.length) {
               this._activeReject = null;
               resolve(results);
-            } else feed(w);
-          } else if (m.type === "error") {
-            failed = true;
-            reject(new Error(m.message));
+            } else {
+              feed(worker);
+            }
+          } else if (message.type === "error") {
+            fail(new Error(message.message));
           }
         };
       }
@@ -95,23 +133,27 @@ class WorkerPool {
   }
 
   dispose() {
-    this.workers.forEach((w) => w.terminate());
+    this.disposed = true;
+    this._initRejects.forEach((reject) => reject(new Error("cancelled")));
+    this._initRejects.clear();
+    this.workers.forEach((worker) => worker.terminate());
     this.workers = [];
     if (this._activeReject) {
-      const rej = this._activeReject;
+      const reject = this._activeReject;
       this._activeReject = null;
-      rej(new Error("cancelled"));
+      reject(new Error("cancelled"));
     }
   }
 }
 
 const pools = {};
+const poolPromises = {};
 
-// Abort an in-flight run: terminate the pool's workers (the only way to stop a
-// busy wasm loop) and drop the pool so the next use spawns a fresh one.
+// Abort an in-flight run. Terminating workers is the only reliable way to stop
+// a busy synchronous WASM frame loop.
 export function cancelEngineRun(engineId) {
   const pool = pools[engineId];
-  if (pool && pool._activeReject) {
+  if (pool) {
     delete pools[engineId];
     pool.dispose();
   }
@@ -119,117 +161,157 @@ export function cancelEngineRun(engineId) {
 
 export async function getPool(engineId) {
   if (pools[engineId]) return pools[engineId];
+  if (poolPromises[engineId]) return poolPromises[engineId];
+
   const cores = navigator.hardwareConcurrency || 4;
-  const size = Math.max(1, Math.min(ENGINE_INFO[engineId].maxWorkers, cores - 1));
-  const pool = new WorkerPool(engineId, size);
-  await pool.init();
-  pools[engineId] = pool;
-  return pool;
+  const maxSize = Math.max(1, Math.min(ENGINE_INFO[engineId].maxWorkers, cores - 1));
+  const pool = new WorkerPool(engineId, maxSize);
+  poolPromises[engineId] = (async () => {
+    try {
+      // Prewarming now starts one worker. More are added only when the clip has
+      // enough chunks to use them, which is much faster for short recordings.
+      await pool.ensureSize(1);
+      pools[engineId] = pool;
+      return pool;
+    } catch (error) {
+      pool.dispose();
+      throw error;
+    } finally {
+      delete poolPromises[engineId];
+    }
+  })();
+  return poolPromises[engineId];
 }
 
-export async function denoiseParallel(engineId, dry, channels, onProgress) {
+export async function denoiseParallel(engineId, dry, channels, onProgress, options = {}) {
   const pool = await getPool(engineId);
-  const n = Math.floor(dry.length / channels);
+  const samples = Math.floor(dry.length / channels);
+  const profile = options.smartStereo === false
+    ? { useMidSide: false, correlation: 0, balance: 1 }
+    : stereoProfile(dry, channels);
+  const useMidSide = channels === 2 && profile.useMidSide;
 
-  // deinterleave
-  const chans = [];
-  for (let c = 0; c < channels; c++) {
-    const a = new Float32Array(n);
-    for (let i = 0, j = c; i < n; i++, j += channels) a[i] = dry[j];
-    chans.push(a);
+  // Deinterleave, or create a coherent mid channel for ordinary camera audio.
+  const sourceChannels = [];
+  if (useMidSide) {
+    const mid = new Float32Array(samples);
+    for (let i = 0, j = 0; i < samples; i++, j += 2) mid[i] = (dry[j] + dry[j + 1]) * 0.5;
+    sourceChannels.push(mid);
+  } else {
+    for (let channel = 0; channel < channels; channel++) {
+      const data = new Float32Array(samples);
+      for (let i = 0, j = channel; i < samples; i++, j += channels) data[i] = dry[j];
+      sourceChannels.push(data);
+    }
   }
 
-  // build tasks: each covers [keepStart, keepEnd) plus prime/crossfade lead-in
-  const numChunks = Math.max(1, Math.ceil(n / CHUNK));
+  // Each task covers a kept interval plus model-state priming/crossfade audio.
+  const numChunks = Math.max(1, Math.ceil(samples / CHUNK));
   const tasks = [];
   const meta = [];
-  for (let c = 0; c < channels; c++) {
-    for (let k = 0; k < numChunks; k++) {
-      const keepStart = k * CHUNK;
-      const keepEnd = Math.min(n, (k + 1) * CHUNK);
-      let data, keepOffset;
-      if (k === 0) {
-        // synthetic prime: process the opening second twice, discard the first pass
-        const p = Math.min(PRIME, n);
-        data = new Float32Array(p + keepEnd);
-        data.set(chans[c].subarray(0, p), 0);
-        data.set(chans[c].subarray(0, keepEnd), p);
-        keepOffset = p;
+  for (let channel = 0; channel < sourceChannels.length; channel++) {
+    for (let chunk = 0; chunk < numChunks; chunk++) {
+      const keepStart = chunk * CHUNK;
+      const keepEnd = Math.min(samples, (chunk + 1) * CHUNK);
+      let data;
+      let keepOffset;
+      if (chunk === 0) {
+        const primeLength = Math.min(PRIME, samples);
+        data = new Float32Array(primeLength + keepEnd);
+        data.set(sourceChannels[channel].subarray(0, primeLength));
+        data.set(sourceChannels[channel].subarray(0, keepEnd), primeLength);
+        keepOffset = primeLength;
       } else {
-        const procStart = Math.max(0, keepStart - PRIME - XFADE);
-        data = chans[c].slice(procStart, keepEnd);
-        keepOffset = keepStart - XFADE - procStart;
+        const processStart = Math.max(0, keepStart - PRIME - XFADE);
+        data = sourceChannels[channel].slice(processStart, keepEnd);
+        keepOffset = keepStart - XFADE - processStart;
       }
       const id = tasks.length;
       tasks.push({ id, data });
-      meta.push({ id, ch: c, k, keepStart, keepEnd, keepOffset, len: data.length });
+      meta.push({ id, channel, chunk, keepStart, keepEnd, keepOffset, length: data.length });
     }
   }
 
-  // progress across all tasks
-  const totalSamples = meta.reduce((s, m) => s + m.len, 0);
-  const taskDone = new Array(tasks.length).fill(0);
-  const results = await pool.run(tasks, (id, done) => {
-    taskDone[id] = Math.min(done, meta[id].len);
-    onProgress?.(taskDone.reduce((a, b) => a + b, 0) / totalSamples);
-  });
+  await pool.ensureSize(Math.min(pool.maxSize, tasks.length));
 
-  // merge in order (crossfade needs the previous chunk's tail in place)
-  const wetChans = chans.map(() => new Float32Array(n));
-  meta.sort((a, b) => a.ch - b.ch || a.k - b.k);
-  for (const m of meta) {
-    const out = results.get(m.id);
-    const wet = wetChans[m.ch];
-    if (m.k === 0) {
-      wet.set(out.subarray(m.keepOffset), 0);
+  const totalSamples = meta.reduce((sum, item) => sum + item.length, 0);
+  const taskDone = new Float64Array(tasks.length);
+  let completedSamples = 0;
+  let results;
+  try {
+    results = await pool.run(tasks, (id, done) => {
+      const next = Math.min(done, meta[id].length);
+      completedSamples += next - taskDone[id];
+      taskDone[id] = next;
+      onProgress?.(completedSamples / totalSamples);
+    });
+  } catch (error) {
+    if (pools[engineId] === pool) delete pools[engineId];
+    pool.dispose();
+    throw error;
+  }
+
+  const wetChannels = sourceChannels.map(() => new Float32Array(samples));
+  meta.sort((a, b) => a.channel - b.channel || a.chunk - b.chunk);
+  for (const item of meta) {
+    const output = results.get(item.id);
+    const wet = wetChannels[item.channel];
+    if (item.chunk === 0) {
+      wet.set(output.subarray(item.keepOffset), 0);
     } else {
-      const xf = Math.min(XFADE, m.keepStart); // safety, always XFADE in practice
-      for (let i = 0; i < xf; i++) {
-        const pos = m.keepStart - xf + i;
-        const w = i / xf;
-        wet[pos] = wet[pos] * (1 - w) + out[m.keepOffset + i] * w;
+      const crossfade = Math.min(XFADE, item.keepStart);
+      for (let i = 0; i < crossfade; i++) {
+        const position = item.keepStart - crossfade + i;
+        const weight = i / crossfade;
+        wet[position] = wet[position] * (1 - weight) + output[item.keepOffset + i] * weight;
       }
-      wet.set(out.subarray(m.keepOffset + xf), m.keepStart);
+      wet.set(output.subarray(item.keepOffset + crossfade), item.keepStart);
     }
   }
 
-  // re-interleave
-  const wet = new Float32Array(dry.length);
-  for (let c = 0; c < channels; c++) {
-    const a = wetChans[c];
-    for (let i = 0, j = c; i < n; i++, j += channels) wet[j] = a[i];
+  if (useMidSide) {
+    const delay = measureDelay(sourceChannels[0], wetChannels[0], 1);
+    const alignedMid = compensateDelay(wetChannels[0], 1, delay);
+    return {
+      wet: reconstructSmartStereo(dry, alignedMid),
+      workers: pool.size,
+      mode: "smart stereo",
+      correlation: profile.correlation,
+      aligned: true,
+    };
   }
-  return { wet, workers: pool.size };
+
+  const wet = new Float32Array(dry.length);
+  for (let channel = 0; channel < channels; channel++) {
+    const data = wetChannels[channel];
+    for (let i = 0, j = channel; i < samples; i++, j += channels) wet[j] = data[i];
+  }
+  return { wet, workers: pool.size, mode: channels > 1 ? "dual channel" : "mono", aligned: false };
 }
 
-// ---------- delay compensation ----------
-
 // Denoisers introduce a small algorithmic delay (RNNoise ~20 ms, DFN3 ~30 ms).
-// Estimate it by cross-correlating dry vs wet on a strided window, so
-// strength-mixing doesn't comb-filter and A/V sync stays exact.
+// Cross-correlation estimates it so strength mixing stays phase-aligned.
 export function measureDelay(dry, wet, channels, maxLag = 4800) {
-  const n = Math.min(Math.floor(dry.length / channels), 48000 * 10);
+  const samples = Math.min(Math.floor(dry.length / channels), 48000 * 10);
   const stride = 8;
   let bestLag = 0;
   let bestScore = -Infinity;
   let zeroScore = 0;
-  for (let lag = 0; lag <= maxLag; lag += 1) {
-    let s = 0;
-    for (let i = lag; i < n; i += stride) {
-      s += dry[(i - lag) * channels] * wet[i * channels];
+  for (let lag = 0; lag <= maxLag; lag++) {
+    let score = 0;
+    for (let i = lag; i < samples; i += stride) {
+      score += dry[(i - lag) * channels] * wet[i * channels];
     }
-    if (lag === 0) zeroScore = s;
-    if (s > bestScore) {
-      bestScore = s;
+    if (lag === 0) zeroScore = score;
+    if (score > bestScore) {
+      bestScore = score;
       bestLag = lag;
     }
   }
-  // only trust a clear peak
   if (bestLag > 0 && bestScore < Math.abs(zeroScore) * 1.05) return 0;
   return bestLag;
 }
 
-// Shift wet earlier by `delay` samples (per channel), zero-padding the tail.
 export function compensateDelay(wet, channels, delay) {
   if (delay <= 0) return wet;
   const out = new Float32Array(wet.length);

@@ -3,82 +3,208 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Shaant — remove background noise from video, in your browser</title>
-  <meta name="description" content="Shaant (शांत) removes background noise from your videos entirely in the browser — nothing is uploaded. RNNoise for speed, DeepFilterNet3 for quality." />
+  <meta name="theme-color" content="#121512" />
+  <meta name="color-scheme" content="dark" />
+  <title>Shaant — private noise removal for video and audio</title>
+  <meta name="description" content="Remove background noise from video and audio in your browser. Shaant uses DeepFilterNet3 and RNNoise locally, so your files never leave your device." />
+  <meta property="og:title" content="Shaant — let the voice through" />
+  <meta property="og:description" content="Private, automatic noise removal for video and audio. Nothing is uploaded." />
   <link rel="stylesheet" href="styles.css" />
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%237c5cff'/><g stroke='white' stroke-width='5' stroke-linecap='round'><line x1='14' y1='26' x2='14' y2='38'/><line x1='24' y1='18' x2='24' y2='46'/><line x1='34' y1='24' x2='34' y2='40'/><line x1='44' y1='29' x2='44' y2='35'/><line x1='54' y1='31' x2='54' y2='33'/></g></svg>" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='15' fill='%23c9f7c5'/><g stroke='%23121512' stroke-width='5' stroke-linecap='round'><line x1='13' y1='27' x2='13' y2='37'/><line x1='23' y1='19' x2='23' y2='45'/><line x1='33' y1='24' x2='33' y2='40'/><line x1='43' y1='29' x2='43' y2='35'/><line x1='53' y1='31' x2='53' y2='33'/></g></svg>" />
 </head>
 <body>
-  <main class="wrap">
-    <header>
-      <h1>Shaant <span class="hindi" title="shaant — quiet">शांत</span></h1>
-      <p class="sub">Remove background noise from a video — right in your browser. Drop a file, wait a moment, then flick the switch while it plays. Nothing is uploaded.</p>
-      <div class="badges">
-        <span class="badge" id="engineBadge">Engine</span>
-        <span class="badge" id="gpuBadge">WebGPU: checking…</span>
+  <a class="skip-link" href="#studio">Skip to cleaner</a>
+  <div class="grain" aria-hidden="true"></div>
+
+  <nav class="site-nav" aria-label="Main navigation">
+    <a class="brand" href="./" aria-label="Shaant home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      <span>Shaant</span>
+      <span class="brand-hindi">शांत</span>
+    </a>
+    <div class="nav-meta">
+      <span class="local-status"><span class="status-dot"></span>Runs locally</span>
+      <a href="https://github.com/nipunbatra/shaant" target="_blank" rel="noopener">View source <span aria-hidden="true">↗</span></a>
+    </div>
+  </nav>
+
+  <main class="wrap" id="studio">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Private audio cleanup</p>
+        <h1>Let the voice through.<br /><span>Leave the room behind.</span></h1>
+        <p class="sub">Drop in a recording. Shaant finds a safe cleanup level, removes fans, traffic, hiss and chatter, then keeps your video pixels untouched.</p>
+      </div>
+      <div class="hero-proof" aria-label="Product highlights">
+        <div><strong>0</strong><span>uploads</span></div>
+        <div><strong>48<small>kHz</small></strong><span>full-band audio</span></div>
+        <div><strong id="coreCount">—</strong><span>CPU workers ready</span></div>
       </div>
     </header>
 
-    <section class="card" id="dropZone">
-      <input type="file" id="fileInput" accept="video/*,audio/*,.mkv,.mov,.mp4,.webm,.m4v,.avi,.mp3,.wav,.m4a,.flac,.ogg" hidden />
-      <div class="drop-inner">
-        <p id="dropTitle"><strong>Drop a video here</strong> or <button class="linklike" id="pickBtn">choose a file</button></p>
-        <p class="hint" id="dropHint">MP4 / MOV / MKV / WebM — audio files work too. Stays on your device.</p>
-        <p class="file-info" id="fileInfo" hidden></p>
-      </div>
-    </section>
+    <div class="studio-grid">
+      <aside class="control-panel" aria-label="Cleanup controls">
+        <section class="panel-section input-section">
+          <div class="section-heading">
+            <span class="step-no">01</span>
+            <div><h2>Choose a recording</h2><p>Long recordings are cleaned in memory-safe parts.</p></div>
+          </div>
 
-    <section class="card settings-card">
-      <div class="tool-row">
-        <div class="engine-seg" role="radiogroup" aria-label="Engine">
-          <label><input type="radio" name="engine" value="dfn3" checked /><span>High&nbsp;quality</span></label>
-          <label><input type="radio" name="engine" value="rnnoise" /><span>Fast</span></label>
+          <div class="drop-zone" id="dropZone" role="button" tabindex="0" aria-controls="fileInput" aria-label="Choose or drop a video or audio file">
+            <input type="file" id="fileInput" accept="video/*,audio/*,.mkv,.mov,.mp4,.webm,.m4v,.avi,.mp3,.wav,.m4a,.flac,.ogg" hidden />
+            <div class="drop-inner">
+              <span class="upload-glyph" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v3.5A2.5 2.5 0 0 0 7.5 20h9a2.5 2.5 0 0 0 2.5-2.5V14"/></svg>
+              </span>
+              <div id="dropTitle">
+                <strong>Drop your file</strong>
+                <span>or <button class="linklike" id="pickBtn" type="button">browse this device</button></span>
+              </div>
+              <p class="hint" id="dropHint">MP4, MOV, MKV, WebM, MP3, WAV and more</p>
+              <div class="file-info" id="fileInfo" hidden>
+                <span class="file-kind" id="fileKind">VID</span>
+                <span class="file-copy"><strong id="fileName"></strong><small id="fileMeta"></small></span>
+                <span class="replace-file">Replace</span>
+              </div>
+            </div>
+          </div>
+          <p class="privacy-line"><span aria-hidden="true">◎</span> Your file stays inside this browser tab.</p>
+        </section>
+
+        <section class="panel-section settings-card">
+          <div class="section-heading">
+            <span class="step-no">02</span>
+            <div><h2>Clean the sound</h2><p>Automatic is tuned to protect speech.</p></div>
+          </div>
+
+          <div class="auto-control">
+            <div>
+              <span class="control-title">Automatic strength</span>
+              <span class="control-copy" id="autoDescription">Listens for the noise floor and protects speech.</span>
+            </div>
+            <label class="mini-switch">
+              <input type="checkbox" id="autoStrength" checked />
+              <span aria-hidden="true"></span>
+              <em id="autoState">On</em>
+            </label>
+          </div>
+
+          <div class="strength-control">
+            <div class="strength-heading">
+              <label for="strength">Cleanup amount</label>
+              <output class="strength-val" id="strengthVal" for="strength">Auto · 70%</output>
+            </div>
+            <input type="range" id="strength" min="0" max="100" value="70" aria-describedby="strengthScale" />
+            <div class="range-scale" id="strengthScale"><span>Natural</span><span>Stronger</span></div>
+          </div>
+
+          <details class="advanced-settings">
+            <summary>Fine-tune the processing</summary>
+            <div class="advanced-body">
+              <span class="field-label">Noise model</span>
+              <div class="engine-seg" role="radiogroup" aria-label="Engine">
+                <label><input type="radio" name="engine" value="dfn3" checked /><span><b>High quality</b><small>Traffic & voices</small></span></label>
+                <label><input type="radio" name="engine" value="rnnoise" /><span><b>Quick clean</b><small>Fans & hiss</small></span></label>
+              </div>
+              <label class="check-row">
+                <span><b>Residual cleanup</b><small>Gently closes the noise floor between phrases.</small></span>
+                <input type="checkbox" id="adaptiveCleanup" checked />
+              </label>
+              <label class="check-row">
+                <span><b>Smart stereo</b><small>Keeps centred speech stable and can process it faster.</small></span>
+                <input type="checkbox" id="smartStereo" checked />
+              </label>
+            </div>
+          </details>
+
+          <div class="badges" aria-label="Processing details">
+            <span class="badge" id="engineBadge">Engine</span>
+            <span class="badge" id="gpuBadge">Runtime: checking…</span>
+          </div>
+        </section>
+      </aside>
+
+      <section class="workspace-card video-card" id="videoCard" data-state="idle" aria-label="Before and after preview">
+        <div class="workspace-head">
+          <div>
+            <p class="eyebrow">Before / after</p>
+            <h2 id="workspaceTitle">Your preview will appear here</h2>
+          </div>
+          <span class="status-chip" id="statusChip" role="status" aria-live="polite">Waiting for a file</span>
         </div>
-        <div class="control-row">
-          <label for="strength">Strength</label>
-          <input type="range" id="strength" min="0" max="100" value="70" />
-          <span class="strength-val" id="strengthVal">70%</span>
+
+        <div class="empty-state" id="emptyState">
+          <div class="empty-wave" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <p>Choose a file to see the waveform, compare the original and cleaned audio, and export the result.</p>
         </div>
-      </div>
-      <p class="hint engine-hint">High quality (default) = DeepFilterNet3 — handles traffic, horns, babble; +17&nbsp;MB on first use. Fast = RNNoise — steady noise (fans, hiss, AC) in seconds. 70% strength keeps a touch of natural ambience; 100% removes everything. Both can be changed any time — even mid-processing.</p>
-    </section>
 
-    <section class="card video-card" id="videoCard" hidden data-state="idle">
-      <div class="ab-row">
-        <span class="ab-label" id="abLabelOrig">Original</span>
-        <label class="switch">
-          <input type="checkbox" id="abToggle" checked disabled />
-          <span class="slider"></span>
-        </label>
-        <span class="ab-label" id="abLabelDen">Noise&nbsp;removed</span>
-        <span class="status-chip" id="statusChip">Waiting…</span>
-      </div>
-      <div class="bar-track" id="barTrack" hidden><div class="bar" id="bar"></div></div>
+        <div class="media-workbench" id="mediaWorkbench" hidden>
+          <div class="progress-wrap" id="barTrack" hidden>
+            <div class="progress-meta"><span id="progressLabel">Preparing locally…</span><span id="progressValue">0%</span></div>
+            <div class="bar-track"><div class="bar" id="bar"></div></div>
+          </div>
 
-      <div class="player-shell">
-        <video id="player" playsinline preload="metadata"></video>
-        <video id="shadowPlayer" playsinline preload="auto" style="display:none"></video>
-        <div class="transport">
-          <button id="playBtn" title="Play/Pause" aria-label="Play"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M2 1l9 5-9 5z"/></svg></button>
-          <input type="range" id="seek" min="0" max="1000" value="0" />
-          <span id="timeLabel">0:00 / 0:00</span>
+          <div class="compare-bar">
+            <span class="ab-label" id="abLabelOrig">Original</span>
+            <label class="switch" title="Switch between original and cleaned audio">
+              <input type="checkbox" id="abToggle" checked disabled aria-label="Play cleaned audio" />
+              <span class="slider"><i aria-hidden="true"></i></span>
+            </label>
+            <span class="ab-label" id="abLabelDen">Noise removed</span>
+            <span class="compare-hint">Switch while playing</span>
+          </div>
+
+          <div class="waveform-shell" id="waveformShell" data-loading="true">
+            <canvas id="waveform" aria-label="Audio waveform comparison"></canvas>
+            <div class="wave-legend"><span><i class="legend-original"></i>Original</span><span><i class="legend-clean"></i>Cleaned</span></div>
+          </div>
+
+          <div class="player-shell">
+            <video id="player" playsinline preload="metadata"></video>
+            <video id="shadowPlayer" playsinline preload="auto" hidden></video>
+            <div class="transport">
+              <button id="playBtn" title="Play or pause" aria-label="Play"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M2 1l9 5-9 5z"/></svg></button>
+              <input type="range" id="seek" min="0" max="1000" value="0" aria-label="Seek through recording" />
+              <span id="timeLabel">0:00 / 0:00</span>
+            </div>
+          </div>
+          <p class="hint player-hint" id="playerHint" hidden></p>
+
+          <div class="quality-strip" id="qualityStrip" hidden>
+            <div><span>Quiet-floor cut</span><strong id="noiseMetric">—</strong></div>
+            <div><span>Voice retained</span><strong id="voiceMetric">—</strong></div>
+            <div><span>Processing</span><strong id="speedMetric">—</strong></div>
+          </div>
+
+          <div class="result-row">
+            <div>
+              <strong id="resultTitle">Cleaned file ready</strong>
+              <span class="result-info" id="resultInfo"></span>
+            </div>
+            <a class="primary download disabled" id="downloadBtn" download aria-disabled="true">
+              <span>Save cleaned file</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M5 20h14"/></svg>
+            </a>
+          </div>
         </div>
-      </div>
-      <p class="hint" id="playerHint" hidden></p>
+      </section>
+    </div>
 
-      <div class="result-row">
-        <a class="primary download disabled" id="downloadBtn" download>Download</a>
-        <span class="result-info" id="resultInfo"></span>
-      </div>
+    <section class="error-card" id="errorBox" hidden role="alert"></section>
+
+    <section class="trust-row" aria-label="How Shaant works">
+      <div><span>01</span><p><strong>Decode locally</strong>Your browser extracts 48 kHz audio. The original file is never uploaded.</p></div>
+      <div><span>02</span><p><strong>Separate voice from noise</strong>Speech-trained WASM models run across available CPU cores.</p></div>
+      <div><span>03</span><p><strong>Copy the picture untouched</strong>Only audio is re-encoded; the original video stream is preserved bit for bit.</p></div>
     </section>
-
-    <section class="card error-card" id="errorBox" hidden></section>
-
-    <footer>
-      <p>Video stream is copied untouched — only the audio track is denoised and re-encoded. Processing is parallelized across your CPU cores. First run downloads ~36 MB of WASM (cached afterwards). Best for files under ~500 MB.</p>
-      <p>Built with <a href="https://github.com/xiph/rnnoise" target="_blank" rel="noopener">RNNoise</a>, <a href="https://github.com/Rikorose/DeepFilterNet" target="_blank" rel="noopener">DeepFilterNet3</a> and <a href="https://ffmpegwasm.netlify.app/" target="_blank" rel="noopener">ffmpeg.wasm</a>.</p>
-    </footer>
   </main>
+
+  <footer class="site-footer">
+    <p><strong>Shaant <span>शांत</span></strong> Quiet tools should respect quiet boundaries.</p>
+    <p>Built with <a href="https://github.com/xiph/rnnoise" target="_blank" rel="noopener">RNNoise</a>, <a href="https://github.com/Rikorose/DeepFilterNet" target="_blank" rel="noopener">DeepFilterNet3</a> and <a href="https://ffmpegwasm.netlify.app/" target="_blank" rel="noopener">ffmpeg.wasm</a>.</p>
+  </footer>
 
   <script type="module" src="js/app.js"></script>
 </body>

@@ -24,9 +24,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    with socketserver.TCPServer(("", port), Handler) as httpd:
-        httpd.allow_reuse_address = True
+    with ReusableTCPServer(("", port), Handler) as httpd:
         print(f"Serving at http://localhost:{port}")
         httpd.serve_forever()

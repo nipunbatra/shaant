@@ -8,22 +8,35 @@ uploads: the whole pipeline runs locally via WebAssembly, so it works offline an
 GitHub Pages.
 
 **Pipeline:** [ffmpeg.wasm](https://ffmpegwasm.netlify.app/) extracts the audio track
-as raw 48 kHz float PCM → a denoise engine processes it frame by frame → ffmpeg.wasm
-re-encodes just the audio (AAC/Opus) and **copies the video stream untouched**, so
-there's no quality loss and no slow video re-encode.
+as raw 48 kHz float PCM → a speech-trained denoise engine processes it frame by
+frame → an adaptive residual expander gently closes the floor between phrases →
+ffmpeg.wasm re-encodes just the audio (AAC/Opus) and **copies the video stream
+untouched**, so there's no picture-quality loss and no slow video re-encode.
 
 ## Engines
 
 | Engine | Speed (M-series Mac, 60 s clip end-to-end) | Best at | Download |
 |---|---|---|---|
-| **Fast** — [RNNoise](https://github.com/xiph/rnnoise) (WASM SIMD by [Shiguredo](https://github.com/shiguredo/rnnoise-wasm)) | ~5 s (≈12× realtime incl. demux/remux) | Steady noise: fans, AC, hiss, hum | in base ~36 MB |
-| **High quality** — [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) (official `wasm` feature, tract runtime, built via `scripts/build-dfn3-wasm.sh`) | ~7 s (≈9× realtime incl. demux/remux) | Non-stationary noise: traffic, horns, babble, keyboards | +17 MB |
+| **Fast** — [RNNoise](https://github.com/xiph/rnnoise) (WASM SIMD by [Shiguredo](https://github.com/shiguredo/rnnoise-wasm)) | 3.4 s (≈17.6× realtime incl. demux/remux) | Steady noise: fans, AC, hiss, hum | in base ~36 MB |
+| **High quality** — [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) (official `wasm` feature, tract runtime, built via `scripts/build-dfn3-wasm.sh`) | 4.9 s (≈12.2× realtime incl. demux/remux) | Non-stationary noise: traffic, horns, babble, keyboards | +17 MB |
 
-Denoising is **parallelized across CPU cores**: the audio is split into 6 s chunks
+Denoising is **parallelized across CPU cores**: the audio is split into 8 s chunks
 (each prefixed with 1 s of state-priming audio that is discarded, seams stitched with
 a 20 ms crossfade) and fanned out to a pool of Web Workers — up to 8 for RNNoise and
-6 for DeepFilterNet3. Worker pools stay warm between runs, and the page preloads
-ffmpeg and the default engine while you're still picking a file.
+6 for DeepFilterNet3. Pools start with one warm worker and grow only when a clip has
+enough chunks to benefit, avoiding the old short-clip startup penalty.
+
+Long recordings use a bounded-memory pipeline automatically. Shaant decodes and
+denoises 90-second sections with a one-second recurrent-state lead-in, stores each
+cleaned section losslessly, then performs one final audio encode while copying the
+original video stream. The source is mounted read-only instead of copied into the WASM
+heap, and the full decoded PCM timeline is never resident in memory.
+
+**Smart Stereo** detects ordinary correlated camera/phone audio, denoises its coherent
+mid channel once, and applies a smoothed model-derived attenuation to the side channel.
+This keeps centred voices stable between left and right while roughly halving neural
+inference. Unbalanced or decorrelated stereo automatically stays on the independent
+dual-channel path.
 
 Both are 48 kHz fullband (no muffled highs) and language-agnostic — they model the
 acoustics of human voice, not any particular language, so Hindi and other languages
@@ -39,17 +52,27 @@ sync is sample-exact and the strength slider never comb-filters.
 
 - Drag & drop a video (MP4 / MOV / MKV / WebM) or an audio file (MP3 / WAV / M4A / …) —
   the video shows immediately and processing starts automatically
-- Engine and strength are selectable **before** dropping a file; defaults to
-  **DeepFilterNet3 at 70%** (a touch of natural ambience is kept — set 100% for
-  maximum removal)
+- **Automatic strength by default**: after the model pass, Shaant compares quiet and
+  speech-level frames, targets a lower noise floor, and caps the mix when the model has
+  attenuated speech. The user gets a safe content-based recommendation instead of
+  guessing a percentage; dragging the slider switches cleanly to manual mode.
+- DeepFilterNet3 is the default quality model. RNNoise remains available under
+  Fine-tune for a smaller, faster pass on fans, AC and hiss.
+- Conservative adaptive residual cleanup lowers model leftovers between phrases
+  without hard-gating breaths and low speech; it can be disabled under Fine-tune.
 - Switching engines mid-processing cancels the in-flight run (worker pool is
   terminated) and restarts with the new engine
 - **Instant iMovie-style A/B switch**: original and processed files play in two
   synchronized players, and the switch just swaps which one is audible — flick it
   mid-playback with zero glitch
 - Live progress bar with stage and percentage
-- Strength slider (0–100%) — changing it after processing only re-mixes and re-muxes,
-  it doesn't re-run the denoiser
+- Strength slider (0–100%) — changing it after processing only re-mixes and re-muxes;
+  it does not re-run the neural model
+- Long-file mode keeps only one decoded audio section in JavaScript at a time, so
+  hour-scale, highly compressed recordings do not create multi-gigabyte PCM arrays
+- Dual waveform preview and measured quiet-floor, voice-retention, and real-time stats
+- Keyboard-accessible file picker, drag/drop and paste support, responsive audio-only
+  mode, inline errors, and same-file reselection
 - Download the result (video codec bit-identical to the input)
 - 100% client-side: private, works offline once cached
 
@@ -82,9 +105,19 @@ stream. Requires `ffmpeg` and Python Playwright on the host.
 ```bash
 bash test/make_test_video.sh
 python3 serve.py 8000 &
+node test/audio_utils_test.mjs
 URL=http://localhost:8000/ ENGINE=rnnoise python3 test/e2e_test.py
 URL=http://localhost:8000/ ENGINE=dfn3 python3 test/e2e_test.py
+# optional adversarial lifecycle pass
+URL=http://localhost:8000/ ENGINE=rnnoise STREAMING=1 STREAMING_PART_SECONDS=3 \
+  INTERRUPT_FILE=test/tmp/noisy_60s.mp4 STRESS_CYCLES=4 python3 test/e2e_test.py
 ```
+
+The unit suite covers auto-strength bounds, speech-protection behavior, residual
+expansion, stereo-path selection, output bounds, waveform analysis and long-file
+planning. The browser suite exercises the real WASM models, engine cancellation,
+live A/B playback, manual re-export, forced multi-part processing, noise reduction,
+duration preservation and bit-identical video copying.
 
 ## Rebuilding the DeepFilterNet3 WASM
 
@@ -106,9 +139,11 @@ reproduce: `bash scripts/build-dfn3-wasm.sh` (needs rustup + wasm-pack).
   or negative gain at this model size. WebGPU becomes the right tool for much bigger
   models (Demucs-class), which don't fit a static-page budget anyway.
 - Audio is processed as stereo 48 kHz; mono inputs are upmixed, so output audio is
-  always stereo.
-- Files are held in memory (ffmpeg.wasm virtual FS), so very large files
-  (≳ 500 MB–1 GB) may fail depending on the device's RAM.
+  always stereo. Smart Stereo automatically falls back to independent channels when
+  correlation or channel balance says the mid/side shortcut would be unsafe.
+- The compressed source and final output still live in ffmpeg.wasm's virtual FS;
+  decoded audio is bounded to one 90-second section. The browser-side input cap is
+  1.5 GB, and practical capacity still depends on available device memory.
 - First load fetches ~36 MB of WASM (ffmpeg core + RNNoise); the HQ engine lazily
   fetches another ~17 MB. Browsers cache both.
 - Both models are trained on speech — they preserve voices and remove background
